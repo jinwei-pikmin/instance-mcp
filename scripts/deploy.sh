@@ -88,6 +88,14 @@ fi
 codesign --force --options runtime --timestamp=none ${KC_ARGS[@]+"${KC_ARGS[@]}"} --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$APP"
 codesign --verify --deep --strict "$APP" && echo "signed: $(codesign -dv "$APP" 2>&1 | grep -E '^(Authority=Apple Dev|TeamIdentifier)' | tr '\n' ' ')"
 
+# Re-serve the Playwright MCP (poc/pw-mcp) as browser_* tools when it is installed,
+# so a lent sandbox session can read pages as text instead of screenshots (#10).
+UPSTREAM_ARGS=""
+if launchctl print "gui/$(id -u)/dev.openab.instance-mcp.pw-mcp" >/dev/null 2>&1; then
+  UPSTREAM_ARGS='    <string>--upstream</string><string>browser=http://127.0.0.1:8794/mcp</string>'
+  echo "pw-mcp LaunchAgent present: re-serving it as browser_* tools"
+fi
+
 echo "--- LaunchAgent $LABEL ---"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 cat >"$PLIST" <<EOF
@@ -102,6 +110,7 @@ cat >"$PLIST" <<EOF
     <string>--token-file</string><string>$TOKEN_FILE</string>
     <string>--menu-bar</string>
     <string>--public-url</string><string>https://$DNSNAME:$HTTPS_PORT/mcp</string>
+$UPSTREAM_ARGS
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

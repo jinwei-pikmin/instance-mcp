@@ -12,8 +12,17 @@ public struct MCPServer: Sendable {
     public let instructions: String?
     private let tools: [String: any Tool]
     private let toolOrder: [String]
+    /// Loopback MCP servers whose tools are merged into `tools/list` (after the
+    /// local ones) and routed on `tools/call`. Resolved at request time, so an
+    /// upstream that is down simply contributes nothing. See `UpstreamMCP`.
+    public let upstreams: [UpstreamMCP]
+    /// Applied to upstream tool names at list/call time. Local tools are already
+    /// filtered by `scoped(to:)`; upstream lists are dynamic, so the filter has
+    /// to travel with the server.
+    public let upstreamFilter: ToolProfile?
 
-    public init(name: String, version: String, instructions: String? = nil, tools: [any Tool]) {
+    public init(name: String, version: String, instructions: String? = nil, tools: [any Tool],
+                upstreams: [UpstreamMCP] = [], upstreamFilter: ToolProfile? = nil) {
         self.serverName = name
         self.serverVersion = version
         self.instructions = instructions
@@ -21,6 +30,21 @@ public struct MCPServer: Sendable {
         for t in tools { map[t.name] = t }
         self.tools = map
         self.toolOrder = tools.map(\.name)
+        self.upstreams = upstreams
+        self.upstreamFilter = upstreamFilter
+    }
+
+    /// Upstream tools visible under the current filter, as `Tool`s.
+    func upstreamTools() async -> [UpstreamTool] {
+        var out: [UpstreamTool] = []
+        for u in upstreams {
+            for d in await u.tools() {
+                let t = UpstreamTool(descriptorValue: d, upstream: u)
+                if upstreamFilter?.allows(t.name) ?? true { out.append(t) }
+            }
+        }
+        // Local names win on collision: an upstream cannot shadow `screenshot`.
+        return out.filter { tools[$0.name] == nil }
     }
 
     /// Tools in declaration order. Used by `scoped(to:)`.
@@ -86,13 +110,19 @@ public struct MCPServer: Sendable {
             return [:]
 
         case "tools/list":
-            return ["tools": .array(toolOrder.compactMap { tools[$0]?.descriptor })]
+            var list = toolOrder.compactMap { tools[$0]?.descriptor }
+            list += await upstreamTools().map(\.descriptor)
+            return ["tools": .array(list)]
 
         case "tools/call":
             guard let name = req.params?["name"]?.stringValue else {
                 throw JSONRPCError.invalidParams("missing tool name")
             }
-            guard let tool = tools[name] else {
+            var resolved: (any Tool)? = tools[name]
+            if resolved == nil, !upstreams.isEmpty {
+                resolved = await upstreamTools().first { $0.name == name }
+            }
+            guard let tool = resolved else {
                 throw JSONRPCError.invalidParams("unknown tool: \(name)")
             }
             let args = req.params?["arguments"] ?? [:]

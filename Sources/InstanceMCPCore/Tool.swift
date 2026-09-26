@@ -20,6 +20,9 @@ public struct ToolResult: Equatable, Sendable {
     public var isError: Bool
     /// Optional machine-readable payload, surfaced as `structuredContent` (MCP 2025-06-18).
     public var structured: JSONValue?
+    /// When set, `json` is this value verbatim: an upstream MCP server's own
+    /// `tools/call` result, relayed without re-encoding (keeps image blocks etc.).
+    public var rawPassthrough: JSONValue? = nil
 
     public init(content: [ToolContent], isError: Bool = false, structured: JSONValue? = nil) {
         self.content = content; self.isError = isError; self.structured = structured
@@ -33,6 +36,7 @@ public struct ToolResult: Equatable, Sendable {
     }
 
     public var json: JSONValue {
+        if let raw = rawPassthrough { return raw }
         var o: [String: JSONValue] = ["content": .array(content.map(\.json))]
         if isError { o["isError"] = true }
         if let s = structured { o["structuredContent"] = s }

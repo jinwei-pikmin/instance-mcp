@@ -4,7 +4,7 @@ import CoreGraphics
 import Foundation
 import InstanceMCPCore
 
-let version = "0.5.0"
+let version = "0.6.0"
 
 struct Options {
     var host = "127.0.0.1"
@@ -18,6 +18,8 @@ struct Options {
     var menuBar = false
     var publicURL: String? = nil
     var attach = true
+    /// name=url pairs; each is a loopback MCP server whose tools are re-served.
+    var upstreams: [(String, URL)] = []
 }
 
 func usage() -> Never {
@@ -35,6 +37,10 @@ func usage() -> Never {
       --insecure-local  Allow unauthenticated requests that arrive on loopback *without*
                         Tailscale headers. For local debugging only.
 
+      --upstream <name=url>  Re-serve the tools of a loopback MCP server (e.g. the Playwright MCP
+                      at browser=http://127.0.0.1:8794/mcp) under this daemon, subject to the
+                      connection's tool profile. Repeatable. Tools appear with the upstream's
+                      own names; sandbox sees an allowlisted subset of browser_*.
       --no-attach     Disable the reverse-attach plane (POST/GET /attach, DELETE /attach/{id}):
                       the human-credentialed endpoint through which Connect / Remote lends this
                       Mac to one openab-pty session (this Mac dials the pod; see the ADR).
@@ -69,6 +75,11 @@ while !args.isEmpty {
     case "--menu-bar": opts.menuBar = true
     case "--public-url": opts.publicURL = next(a)
     case "--no-attach": opts.attach = false
+    case "--upstream":
+        let v = next(a)
+        guard let eq = v.firstIndex(of: "="), let u = URL(string: String(v[v.index(after: eq)...])),
+              u.host != nil else { fputs("--upstream wants name=http://host:port/path\n", stderr); usage() }
+        opts.upstreams.append((String(v[..<eq]), u))
     case "--version": print(version); exit(0)
     case "-h", "--help": usage()
     default: fputs("unknown flag \(a)\n", stderr); usage()
@@ -113,9 +124,15 @@ let server = MCPServer(
         probably showing: screenshot it and click Allow. `exec` is a plain `zsh -f` shell as the desktop user \
         (add `/opt/homebrew/bin` to PATH via `env` if needed) and is the right tool for files and commands; \
         for long jobs (builds) that outlive one request use `exec_start` then `exec_poll`/`exec_cancel`. \
-        Call `sys_info` when unsure which permissions or displays exist.
+        Call `sys_info` when unsure which permissions or displays exist.\(opts.upstreams.isEmpty ? "" : """
+         A browser is available through the `browser_*` tools (Playwright, a real window on this Mac's \
+        desktop): prefer `browser_navigate` + `browser_snapshot` (accessibility tree as text) to read a \
+        page, and `browser_click` / `browser_type` / `browser_fill_form` to act — they are exact and need \
+        no screenshots. Fall back to `screenshot` only for things outside the browser.
+        """)
         """,
-    tools: [SysInfoTool(agentVersion: version), ExecTool(), ExecStartTool(), ExecPollTool(), ExecListTool(), ExecCancelTool(), ScreenshotTool(), MouseTool(), KeyTool(), OsascriptTool()]
+    tools: [SysInfoTool(agentVersion: version), ExecTool(), ExecStartTool(), ExecPollTool(), ExecListTool(), ExecCancelTool(), ScreenshotTool(), MouseTool(), KeyTool(), OsascriptTool()],
+    upstreams: opts.upstreams.map { UpstreamMCP(name: $0.0, url: $0.1, log: log) }
 )
 let attachManager: AttachManager? = opts.attach ? AttachManager(server: server, log: log) : nil
 let endpoint = MCPHTTPEndpoint(path: opts.path, server: server, auth: auth, attach: attachManager, log: log)
@@ -130,7 +147,7 @@ do {
 }
 log("oab-instance-mcp \(version) starting on http://\(opts.host):\(opts.port)\(opts.path) " +
     "auth=[logins:\(opts.allowLogins.sorted().joined(separator: ",")) token:\(opts.token != nil) insecure-local:\(opts.insecureLocal)] " +
-    "attach=\(opts.attach) " +
+    "attach=\(opts.attach) upstreams=[\(opts.upstreams.map { $0.0 }.joined(separator: ","))] " +
     "screen_recording=\(CGPreflightScreenCaptureAccess()) accessibility=\(AXIsProcessTrusted())")
 http.start()
 

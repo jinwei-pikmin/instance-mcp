@@ -161,8 +161,10 @@ public actor AttachManager {
             You reached this Mac through OpenAB Connect: a human lent it to your sandbox session for a \
             limited time and is likely watching the screen. This is the `sandbox` profile — there is no \
             `exec` tool here (you already have a shell in your own session); drive the Mac through \
-            `screenshot`, `mouse`, `key` and `osascript`. If a tool starts failing with "not attached", \
-            the grant ended; ask the human to lend the Mac again.
+            `screenshot`, `mouse`, `key` and `osascript`, and — when `browser_*` tools are listed — through \
+            the browser directly: `browser_navigate` then `browser_snapshot` gives you the page as text, \
+            no screenshot needed. If a tool starts failing with "not attached", the grant ended; ask the \
+            human to lend the Mac again.
             """
     }
 

@@ -139,6 +139,26 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/
   grant is the identity; `Tailscale-User-Login` there would be pod-supplied.
 - `--no-attach` disables the plane (`/attach` → 404).
 
+### Browser tools for lent sessions (`--upstream`)
+
+The sandbox has no path to any browser, so browser control is served **from this Mac**: with
+`--upstream browser=http://127.0.0.1:8794/mcp` (deploy.sh adds it when the Playwright MCP
+LaunchAgent from [`poc/pw-mcp`](poc/pw-mcp/README.md) is installed) the daemon re-serves
+Playwright's tools under its own `tools/list`, filtered by the connection's profile:
+
+- `owner` sees all 32 `browser_*` tools; `sandbox` sees the navigate / read / interact subset
+  (`ToolProfile.sandboxBrowserTools`) and **not** `browser_run_code_unsafe`, file upload / PDF,
+  network inspection, raw mouse-by-coordinate, dialogs, `browser_close`. New Playwright tools are
+  denied under sandbox until listed.
+- `browser_navigate` + `browser_snapshot` returns the page as an accessibility tree — the first
+  video title on a channel page is one text line, no screenshot, no OCR. The browser is a real
+  window on this Mac's desktop, so Connect's Screens pane shows what the agent is doing.
+- Upstream down → its tools are absent from `tools/list`; everything else works. The upstream's
+  `Mcp-Session-Id` is re-established automatically. Local tool names win on collision.
+
+Verified 2026-09-26 from a lent pod session (sandbox): 16 `browser_*` tools listed, `run_code_unsafe`
+unknown, navigate → snapshot on a YouTube channel returned the first video's title as text.
+
 Verified 2026-09-26 end to end on macmini against the openab-pty runtime (PR #38): mint via
 `admin_credential`, dial, the session shell's `$OPENAB_TOOLS_MCP_URL` listed
 `sys_info screenshot mouse key osascript instance_status`, `exec` refused, `sys_info` answered,

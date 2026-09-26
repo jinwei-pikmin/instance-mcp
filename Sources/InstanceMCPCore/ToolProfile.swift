@@ -14,13 +14,27 @@ public enum ToolProfile: String, Codable, Sendable, CaseIterable {
     case owner
     case sandbox
 
-    /// `nil` means "no filter". Match is on the tool name.
+    /// Match is on the tool name.
     public func allows(_ toolName: String) -> Bool {
         switch self {
         case .owner: return true
-        case .sandbox: return !toolName.hasPrefix("exec")
+        case .sandbox:
+            if toolName.hasPrefix("exec") { return false }
+            if toolName.hasPrefix("browser_") { return Self.sandboxBrowserTools.contains(toolName) }
+            return true
         }
     }
+
+    /// Playwright MCP tools a lent sandbox may use: navigate, read, interact.
+    /// Not: arbitrary code in the browser process, the filesystem (upload / PDF),
+    /// raw network inspection, dialogs, media emulation, closing the browser.
+    /// Anything Playwright adds later is denied until listed here.
+    public static let sandboxBrowserTools: Set<String> = [
+        "browser_navigate", "browser_navigate_back", "browser_snapshot", "browser_find",
+        "browser_click", "browser_type", "browser_fill_form", "browser_press_key", "browser_hover",
+        "browser_select_option", "browser_wait_for", "browser_tabs", "browser_take_screenshot",
+        "browser_console_messages", "browser_resize", "browser_evaluate",
+    ]
 }
 
 extension MCPServer {
@@ -33,7 +47,9 @@ extension MCPServer {
             name: serverName,
             version: serverVersion,
             instructions: instructions ?? self.instructions,
-            tools: allTools.filter { profile.allows($0.name) }
+            tools: allTools.filter { profile.allows($0.name) },
+            upstreams: upstreams,
+            upstreamFilter: profile
         )
     }
 }
