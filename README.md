@@ -132,7 +132,9 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/
   forced `tools/call exec` is an *unknown tool* error. Widening is a new grant.
 - Either `secret` (already minted by the operator at the runtime) or `admin_credential` (the Mac
   mints, TTL is the runtime's) — exactly one. A new grant for the same runtime+session replaces the
-  old one; that is renewal.
+  old one; that is renewal. `ttl_secs` is forwarded all the way to the runtime (not just held by
+  the Mac): Connect/Remote offer exactly 1/2/4/12/24 hours; instance-mcp accepts up to 24h, and a
+  runtime with a lower operator ceiling rejects the request rather than silently shortening it.
 - **Redial policy** (openab-pty §9.2): stop on `4001` expired · `4002` replaced · `4004` session
   ended · `4010` revoked · handshake `401`; redial with backoff (1 s → 30 s) on `1000` / `4006` /
   errors until the grant deadline. Nothing on the attached socket is trusted as identity — the

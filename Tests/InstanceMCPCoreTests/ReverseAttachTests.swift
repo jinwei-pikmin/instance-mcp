@@ -144,6 +144,7 @@ final class AttachEndpointTests: XCTestCase {
             (["runtime": "ws://h:1", "session": "Bad_Name", "secret": "x"], "session"),
             (["runtime": "ws://h:1", "session": "s", "secret": "x", "profile": "root"], "profile"),
             (["runtime": "ws://h:1", "session": "s", "secret": "x", "ttl_secs": 0], "ttl"),
+            (["runtime": "ws://h:1", "session": "s", "secret": "x", "ttl_secs": 86401], "ttl"),
             (["runtime": "ws://h:1", "session": "s"], "exactly one"),
             (["runtime": "ws://h:1", "session": "s", "secret": "x", "admin_credential": "y"], "exactly one"),
         ]
@@ -214,6 +215,24 @@ final class AttachEndpointTests: XCTestCase {
         let (ep, _) = makeEndpoint(mint: { _, _, _, _ in throw AttachManager.Failure.mintFailed(status: 401, body: "") })
         let r = await ep.handle(req("POST", "/attach", body: ["runtime": "ws://127.0.0.1:9", "session": "s", "admin_credential": "bad"]), remoteIsLoopback: true)
         XCTAssertEqual(r.status, 502)
+    }
+
+    func testRuntimeMintRequestForwardsTheRequestedLeaseTTL() throws {
+        let req = AttachManager.runtimeMintRequest(
+            runtime: URL(string: "wss://pod.tail.example:8090/base/")!,
+            session: "mac",
+            credential: "admin-secret",
+            ttl: 24 * 3600
+        )
+        XCTAssertEqual(req.url?.absoluteString,
+                       "https://pod.tail.example:8090/base/admin/sessions/mac/tools-attach")
+        XCTAssertEqual(req.httpMethod, "POST")
+        XCTAssertEqual(req.value(forHTTPHeaderField: "Authorization"), "Bearer admin-secret")
+        XCTAssertEqual(req.value(forHTTPHeaderField: "Content-Type"), "application/json")
+        let body = try JSONCoding.decoder.decode(JSONValue.self, from: XCTUnwrap(req.httpBody))
+        XCTAssertEqual(body["ttl_secs"]?.intValue, 24 * 3600,
+                       "the Mac→runtime hop must not silently fall back to the runtime's 1h default")
+        XCTAssertEqual(body.objectValue?.count, 1)
     }
 }
 

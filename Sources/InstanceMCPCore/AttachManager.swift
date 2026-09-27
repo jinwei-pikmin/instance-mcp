@@ -47,7 +47,7 @@ public actor AttachManager {
         }
     }
 
-    public static let maxTTL: TimeInterval = 12 * 3600
+    public static let maxTTL: TimeInterval = 24 * 3600
     public static let defaultTTL: TimeInterval = 3600
 
     private let baseServer: MCPServer
@@ -168,9 +168,15 @@ public actor AttachManager {
             """
     }
 
-    /// `POST {runtime as http(s)}/admin/sessions/{session}/tools-attach` with the
-    /// admin credential. The credential is used for this request and discarded.
-    static let mintAtRuntime: @Sendable (URL, String, String, TimeInterval) async throws -> (secret: String, expiresIn: TimeInterval) = { runtime, session, credential, _ in
+    /// Build the exact runtime mint request. Keeping the body shape in a pure
+    /// function gives tests a seam for the bug where Connect requested 12h but
+    /// this hop sent an empty POST, silently reducing every lease to one hour.
+    static func runtimeMintRequest(
+        runtime: URL,
+        session: String,
+        credential: String,
+        ttl: TimeInterval
+    ) -> URLRequest {
         var c = URLComponents(url: runtime, resolvingAgainstBaseURL: false)!
         c.scheme = (c.scheme?.lowercased() == "wss") ? "https" : "http"
         let base = c.path.hasSuffix("/") ? String(c.path.dropLast()) : c.path
@@ -178,7 +184,24 @@ public actor AttachManager {
         var req = URLRequest(url: c.url!)
         req.httpMethod = "POST"
         req.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try! JSONCoding.encoder.encode(JSONValue.object([
+            "ttl_secs": .number(ttl.rounded(.down)),
+        ]))
         req.timeoutInterval = 15
+        return req
+    }
+
+    /// `POST {runtime as http(s)}/admin/sessions/{session}/tools-attach` with the
+    /// admin credential and the lease requested by Connect/Remote. The credential
+    /// is used for this request and discarded.
+    static let mintAtRuntime: @Sendable (URL, String, String, TimeInterval) async throws -> (secret: String, expiresIn: TimeInterval) = { runtime, session, credential, ttl in
+        let req = runtimeMintRequest(
+            runtime: runtime,
+            session: session,
+            credential: credential,
+            ttl: ttl
+        )
         let (data, resp) = try await URLSession(configuration: .ephemeral).data(for: req)
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 201,
