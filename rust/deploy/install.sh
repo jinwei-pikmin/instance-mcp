@@ -50,9 +50,12 @@ sleep 1
 curl -fsS "http://127.0.0.1:$local_port/healthz" >/dev/null && echo "healthz ok"
 
 echo "==> tailscale serve :$https_port -> 127.0.0.1:$local_port"
-if ! tailscale serve --bg --https="$https_port" "http://127.0.0.1:$local_port" 2>/dev/null; then
-  echo "tailscale serve needs operator rights; run once:  sudo tailscale set --operator=\$USER" >&2
-  echo "then re-run this script." >&2
+if ! tailscale serve --bg --https="$https_port" "http://127.0.0.1:$local_port"; then
+  echo >&2
+  echo "tailscale serve failed (output above). Common causes:" >&2
+  echo "  - Serve/HTTPS not enabled on the tailnet: open the link above as a tailnet admin" >&2
+  echo "  - no operator rights: sudo tailscale set --operator=\$USER" >&2
+  echo "Then re-run this script; the service itself is already running on 127.0.0.1:$local_port." >&2
   exit 1
 fi
 
