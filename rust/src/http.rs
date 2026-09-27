@@ -13,9 +13,10 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use serde_json::Value;
 
+use crate::attach::{AttachError, AttachManager, AttachRequest, DEFAULT_TTL_SECS};
 use crate::auth::{AuthPolicy, Decision};
 use crate::log;
-use crate::mcp::{rpc_error, McpServer, RpcRequest};
+use crate::mcp::{rpc_error, McpServer, RpcRequest, ToolProfile};
 
 /// Matches Swift `HTTPParser.maxBodyBytes`.
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -25,15 +26,23 @@ pub struct Endpoint {
     pub server: McpServer,
     pub auth: AuthPolicy,
     sessions: Mutex<HashSet<String>>,
+    /// Reverse-attach grants (`/attach`). None ⇒ those routes answer 404.
+    attach: Option<Arc<AttachManager>>,
 }
 
 impl Endpoint {
-    pub fn new(path: String, server: McpServer, auth: AuthPolicy) -> Arc<Self> {
+    pub fn new(
+        path: String,
+        server: McpServer,
+        auth: AuthPolicy,
+        attach: Option<Arc<AttachManager>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             path,
             server,
             auth,
             sessions: Mutex::new(HashSet::new()),
+            attach,
         })
     }
 }
@@ -75,7 +84,8 @@ async fn handle(
     if path == "/healthz" {
         return text(StatusCode::OK, "ok\n");
     }
-    if path != ep.path {
+    let is_attach = ep.attach.is_some() && (path == "/attach" || path.starts_with("/attach/"));
+    if path != ep.path && !is_attach {
         return text(StatusCode::NOT_FOUND, "not found\n");
     }
 
@@ -100,6 +110,19 @@ async fn handle(
         Decision::Allow { principal } => principal,
     };
 
+    if is_attach {
+        // Same AuthPolicy as /mcp: the human's credential, never the sandbox's.
+        return attach_route(
+            ep.attach.as_ref().unwrap(),
+            &method,
+            path,
+            &hdrs,
+            &body,
+            &principal,
+        )
+        .await;
+    }
+
     match method {
         Method::POST => post(&ep, &hdrs, &body, &principal).await,
         Method::DELETE => {
@@ -112,6 +135,86 @@ async fn handle(
             StatusCode::METHOD_NOT_ALLOWED,
             "server-initiated streams not supported\n",
         ),
+        _ => text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
+    }
+}
+
+fn error_json(status: StatusCode, msg: &str) -> Response {
+    json(status, &serde_json::json!({ "error": msg }))
+}
+
+/// `POST /attach` create · `GET /attach` list · `GET|DELETE /attach/{id}` read / revoke.
+async fn attach_route(
+    mgr: &AttachManager,
+    method: &Method,
+    path: &str,
+    hdrs: &HashMap<String, String>,
+    body: &[u8],
+    principal: &str,
+) -> Response {
+    mgr.sweep();
+    let id = path
+        .strip_prefix("/attach")
+        .unwrap_or("")
+        .trim_start_matches('/');
+    match (method, id.is_empty()) {
+        (&Method::GET, true) => json(StatusCode::OK, &serde_json::json!({ "grants": mgr.list() })),
+        (&Method::POST, true) => {
+            let is_json = hdrs
+                .get("content-type")
+                .is_some_and(|c| c.to_ascii_lowercase().starts_with("application/json"));
+            let body: Option<Value> = serde_json::from_slice(body).ok().filter(|_| is_json);
+            let Some(body) = body.filter(Value::is_object) else {
+                return error_json(StatusCode::BAD_REQUEST, "body must be a JSON object");
+            };
+            let str_field = |k: &str| body.get(k).and_then(Value::as_str).map(String::from);
+            let Some(runtime) = str_field("runtime") else {
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    "runtime (ws:// or wss:// URL) is required",
+                );
+            };
+            let Some(session) = str_field("session") else {
+                return error_json(StatusCode::BAD_REQUEST, "session is required");
+            };
+            let profile_str = str_field("profile").unwrap_or_else(|| "sandbox".into());
+            let Some(profile) = ToolProfile::parse(&profile_str) else {
+                let all: Vec<&str> = ToolProfile::ALL.iter().map(|p| p.as_str()).collect();
+                return error_json(
+                    StatusCode::BAD_REQUEST,
+                    &format!("profile must be one of {all:?}"),
+                );
+            };
+            let ttl_secs = crate::mcp::arg_i64(&body, "ttl_secs").unwrap_or(DEFAULT_TTL_SECS);
+            let req = AttachRequest {
+                runtime,
+                session,
+                profile,
+                ttl_secs,
+                secret: str_field("secret"),
+                admin_credential: str_field("admin_credential"),
+            };
+            match mgr.create(req, principal).await {
+                Ok(grant) => json(StatusCode::ACCEPTED, &grant),
+                Err(e @ AttachError::BadRequest(_)) => {
+                    error_json(StatusCode::BAD_REQUEST, &e.to_string())
+                }
+                Err(e @ AttachError::MintFailed { .. }) => {
+                    error_json(StatusCode::BAD_GATEWAY, &e.to_string())
+                }
+            }
+        }
+        (&Method::GET, false) => match mgr.get(id) {
+            Some(g) => json(StatusCode::OK, &g),
+            None => error_json(StatusCode::NOT_FOUND, "no such grant"),
+        },
+        (&Method::DELETE, false) => {
+            if mgr.revoke(id) {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                error_json(StatusCode::NOT_FOUND, "no such grant")
+            }
+        }
         _ => text(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n"),
     }
 }
@@ -212,7 +315,7 @@ mod tests {
     fn app() -> Router {
         let server = McpServer::new("t", "0", None, vec![Arc::new(Ping)]);
         let auth = AuthPolicy::new(["me@x.io".into()], Some("tok".into()), false);
-        router(Endpoint::new("/mcp".into(), server, auth))
+        router(Endpoint::new("/mcp".into(), server, auth, None))
     }
 
     async fn send(app: &Router, req: Request<Body>) -> (StatusCode, HeaderMap, String) {

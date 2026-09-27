@@ -1,6 +1,7 @@
 //! oab-instance-mcp (Rust) — MCP server exposing this machine to a coding CLI or agent on
 //! the tailnet. Same flags, auth and wire contract as the Swift build; see `README.md`.
 
+mod attach;
 mod auth;
 mod http;
 mod mcp;
@@ -36,6 +37,7 @@ struct Options {
     token_file: Option<String>,
     insecure_local: bool,
     quiet: bool,
+    attach: bool,
 }
 
 fn usage() -> ! {
@@ -44,7 +46,7 @@ fn usage() -> ! {
 
 USAGE: oab-instance-mcp [--host 127.0.0.1] [--port 8795] [--path /mcp]
                         [--allow-login <email>]... [--token <str> | --token-file <path>]
-                        [--insecure-local] [--quiet]
+                        [--insecure-local] [--quiet] [--no-attach]
 
 Auth (at least one required unless --insecure-local):
   --allow-login   Tailscale login (from `tailscale serve`'s Tailscale-User-Login header). Repeatable.
@@ -53,7 +55,11 @@ Auth (at least one required unless --insecure-local):
   --insecure-local  Allow unauthenticated requests that arrive on loopback *without*
                     Tailscale headers. For local debugging only.
 
-Not yet in the Rust build: --upstream, reverse attach (/attach), --menu-bar.
+  --no-attach     Disable the reverse-attach plane (POST/GET /attach, DELETE /attach/{{id}}):
+                  the human-credentialed endpoint through which Connect / Remote lends this
+                  machine to one openab-pty session (this machine dials the pod).
+
+Not yet in the Rust build: --upstream, --menu-bar.
 
 Run it as a systemd *user* service in the logged-in user's session, bound to loopback,
 behind `tailscale serve` (see rust/deploy/).",
@@ -72,6 +78,7 @@ fn parse_args() -> Options {
         token_file: None,
         insecure_local: false,
         quiet: false,
+        attach: true,
     };
     let mut args = std::env::args().skip(1);
     let next = |flag: &str, args: &mut dyn Iterator<Item = String>| {
@@ -95,8 +102,7 @@ fn parse_args() -> Options {
             "--token-file" => o.token_file = Some(next(&a, &mut args)),
             "--insecure-local" => o.insecure_local = true,
             "--quiet" => o.quiet = true,
-            // Accepted so shared launch scripts work; the attach plane does not exist here yet.
-            "--no-attach" => {}
+            "--no-attach" => o.attach = false,
             "--upstream" | "--menu-bar" | "--public-url" => {
                 eprintln!("{a} is not supported by the Rust build yet");
                 std::process::exit(64)
@@ -147,6 +153,8 @@ fn instructions() -> String {
 #[tokio::main]
 async fn main() {
     let opts = parse_args();
+    // One TLS crypto provider for every rustls user (wss:// dial, https:// mint).
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let _ = QUIET.set(opts.quiet);
 
     let auth = AuthPolicy::new(
@@ -175,7 +183,10 @@ async fn main() {
     let server = McpServer::new("oab-instance-mcp", VERSION, Some(instructions()), tools);
     let _ = sys_info.tool_names.set(server.tool_names());
     let tool_list = server.tool_names().join(",");
-    let endpoint = http::Endpoint::new(opts.path.clone(), server, auth);
+    let attach = opts
+        .attach
+        .then(|| attach::AttachManager::new(server.clone(), None));
+    let endpoint = http::Endpoint::new(opts.path.clone(), server, auth, attach);
 
     let addr: SocketAddr = match format!("{}:{}", opts.host, opts.port).parse() {
         Ok(a) => a,
@@ -192,12 +203,13 @@ async fn main() {
         }
     };
     log(&format!(
-        "oab-instance-mcp {VERSION} (rust/{}) starting on http://{addr}{} auth=[logins:{} token:{} insecure-local:{}] tools=[{tool_list}]",
+        "oab-instance-mcp {VERSION} (rust/{}) starting on http://{addr}{} auth=[logins:{} token:{} insecure-local:{}] attach={} tools=[{tool_list}]",
         std::env::consts::OS,
         opts.path,
         opts.allow_logins.join(","),
         opts.token.is_some(),
         opts.insecure_local,
+        opts.attach,
     ));
 
     let app = http::router(endpoint).into_make_service_with_connect_info::<SocketAddr>();

@@ -188,7 +188,6 @@ pub trait Tool: Send + Sync {
 /// no `exec*` (the agent already has a shell in its sandbox) and an allowlisted
 /// `browser_*` subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // selected per connection by reverse attach (phase 2)
 pub enum ToolProfile {
     Owner,
     Sandbox,
@@ -213,6 +212,19 @@ impl ToolProfile {
         "browser_resize",
         "browser_evaluate",
     ];
+
+    pub const ALL: [ToolProfile; 2] = [ToolProfile::Owner, ToolProfile::Sandbox];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ToolProfile::Owner => "owner",
+            ToolProfile::Sandbox => "sandbox",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == s)
+    }
 
     pub fn allows(self, tool: &str) -> bool {
         match self {
@@ -262,17 +274,19 @@ impl McpServer {
         self.tools.iter().map(|t| t.name()).collect()
     }
 
-    /// The same server with its tool list narrowed to `profile`. `tools/call` on an
-    /// omitted tool is an *unknown tool* error, indistinguishable from one that never existed.
-    #[allow(dead_code)] // used by reverse attach
-    pub fn scoped(&self, profile: ToolProfile) -> Self {
+    /// The same server with its tool list narrowed to `profile` and, optionally, its own
+    /// instructions. `tools/call` on an omitted tool is an *unknown tool* error,
+    /// indistinguishable from one that never existed — the agent is not told there is
+    /// something it may not have.
+    pub fn scoped(&self, profile: ToolProfile, instructions: Option<String>) -> Self {
         let tools = self
             .tools
             .iter()
             .filter(|t| profile.allows(t.name()))
             .cloned()
             .collect();
-        Self::new(&self.name, &self.version, self.instructions.clone(), tools)
+        let instructions = instructions.or_else(|| self.instructions.clone());
+        Self::new(&self.name, &self.version, instructions, tools)
     }
 
     /// Returns None for notifications (no response body) — the HTTP layer answers 202.
@@ -443,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_scope_hides_exec() {
-        let s = server().scoped(ToolProfile::Sandbox);
+        let s = server().scoped(ToolProfile::Sandbox, None);
         assert_eq!(s.tool_names(), vec!["sys_info"]);
         let r = call(
             &s,
