@@ -1,0 +1,15 @@
+[Unit]
+Description=oab-instance-mcp (MCP server exposing this machine to the tailnet)
+Documentation=https://github.com/openabdev/instance-mcp
+# Start with the desktop session so WAYLAND_DISPLAY etc. are in the environment.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/oab-instance-mcp --host 127.0.0.1 --port 8795 --allow-login @ALLOW_LOGIN@ --token-file %h/.config/oab-instance-mcp/token
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

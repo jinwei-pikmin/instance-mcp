@@ -1,0 +1,26 @@
+[package]
+name = "oab-instance-mcp"
+version = "0.7.0"
+edition = "2021"
+description = "MCP server exposing this machine (exec / sys_info; screenshot / input per platform backend)"
+license = "MIT"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "signal", "sync", "fs", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
