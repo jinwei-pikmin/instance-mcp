@@ -84,8 +84,7 @@ upgrade/origin checks, per-dispatch profile enforcement). Therefore:
 ### "Self-contained binary" — honest dependency/deployment reality
 
 The Rust binary is self-contained for its own code + rustls, but it is **not** literally
-scp-and-run: it depends on external CLIs/daemons on graphical Linux nodes (`grim`, `ydotool`
-+ `ydotoold`, `wlr-randr`), a **udev rule** for non-root `/dev/uinput`, and a live compositor
+scp-and-run: it depends on external CLIs/daemons on graphical Linux nodes (`grim`, `ydotool` plus `ydotoold`, `wlr-randr`), a **udev rule** for non-root `/dev/uinput`, and a live compositor
 seat. The deployment story must package these (image/cloud-init) and the binary must
 **probe capabilities + detect versions at startup** and degrade explicitly (e.g. headless
 node → graphical tools disabled, exec/sysinfo/MCP still available).
