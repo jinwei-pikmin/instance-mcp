@@ -164,6 +164,19 @@ Verified 2026-09-26 end to end on macmini against the openab-pty runtime (PR #38
 `sys_info screenshot mouse key osascript instance_status`, `exec` refused, `sys_info` answered,
 `DELETE /attach/{id}` detached.
 
+## TCC grants survive re-deploys only if the signature does
+
+Screen Recording, Accessibility and Full Disk Access are keyed on the **code-signing identity +
+bundle id**, not the path. So a grant you make once in System Settings stays across upgrades
+**only if every build is signed by the same identity**. An ad-hoc signature (`codesign -s -`)
+has no stable identity — macOS treats each one as a new app and silently drops every grant, and
+the symptom is the Screens pane freezing / `screen_recording=false` after a deploy.
+
+Therefore `deploy.sh` **refuses to install anything but a Team-signed bundle** (team `6LPQNY95AQ`).
+Run it from a console session (the login keychain is locked over SSH, which is why ad-hoc kept
+sneaking in). You grant each permission **once**; later versions keep it. Override for a throwaway
+local build with `ALLOW_ADHOC=1`, accepting that you will have to re-grant.
+
 ## Build & test (on macmini; the laptop never compiles Swift)
 
 ```sh

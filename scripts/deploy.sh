@@ -1,6 +1,9 @@
 #!/bin/bash
 # Deploy oab-instance-mcp on this Mac (run ON the target, e.g. macmini).
 #   scripts/deploy.sh <allow-login-email> <codesign-identity>
+#   Team-signed only: installing an ad-hoc bundle drops the human's TCC grants, so it is
+#   refused unless ALLOW_ADHOC=1. Expected team defaults to 6LPQNY95AQ (EXPECT_TEAM=... to change).
+#
 #   env: KEYCHAIN=<path to keychain-db>            keychain holding the identity (default: login keychain)
 #        KEYCHAIN_PASSWORD_FILE=<path>              if set, unlock $KEYCHAIN first (needed over non-interactive
 #                                                   SSH: the login keychain answers errSecInternalComponent)
@@ -87,6 +90,30 @@ if [ -n "${KEYCHAIN:-}" ]; then
 fi
 codesign --force --options runtime --timestamp=none ${KC_ARGS[@]+"${KC_ARGS[@]}"} --sign "$IDENTITY" --identifier "$BUNDLE_ID" "$APP"
 codesign --verify --deep --strict "$APP" && echo "signed: $(codesign -dv "$APP" 2>&1 | grep -E '^(Authority=Apple Dev|TeamIdentifier)' | tr '\n' ' ')"
+
+# TCC (Full Disk Access, Screen Recording, Accessibility) is keyed on the code-signing
+# identity + bundle id. An ad-hoc signature has no stable identity, so macOS treats each
+# ad-hoc build as a NEW app and silently drops every grant the user made — the Screens pane
+# then freezes and screenshot returns "screen_recording=false". That happened repeatedly
+# (see openab-pty#37 / instance-mcp#10) whenever a fast SSH deploy fell back to `--sign -`.
+# Refuse to install anything but a Team-signed bundle, so a grant the human made ONCE is
+# never quietly invalidated by a later deploy. Override only when you knowingly want an
+# unsigned local build (and accept re-granting): ALLOW_ADHOC=1.
+TEAM=$(codesign -dvv "$APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+EXPECT_TEAM="${EXPECT_TEAM:-6LPQNY95AQ}"
+if [ "${ALLOW_ADHOC:-0}" != "1" ]; then
+    if [ -z "$TEAM" ] || [ "$TEAM" = "not set" ]; then
+        echo "refusing to install an ad-hoc-signed bundle: it would drop your TCC grants" >&2
+        echo "  (Full Disk Access / Screen Recording / Accessibility are keyed on the signing identity)." >&2
+        echo "  Sign with the Apple Development identity from a console session, or set ALLOW_ADHOC=1 to override." >&2
+        exit 1
+    fi
+    if [ "$TEAM" != "$EXPECT_TEAM" ]; then
+        echo "refusing: signed by team $TEAM, expected $EXPECT_TEAM — a different team is a different app to TCC." >&2
+        echo "  Set EXPECT_TEAM=$TEAM if this is intentional." >&2
+        exit 1
+    fi
+fi
 
 # Re-serve the Playwright MCP (poc/pw-mcp) as browser_* tools when it is installed,
 # so a lent sandbox session can read pages as text instead of screenshots (#10).
