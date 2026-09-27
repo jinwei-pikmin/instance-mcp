@@ -15,6 +15,20 @@ UID_=$(/usr/bin/id -u "$CONSOLE_USER")
 HOME_DIR=$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | \
   /usr/bin/sed 's/^NFSHomeDirectory: //')
 [ -d "$HOME_DIR" ] || { echo "oab-instance-mcp: home not found for $CONSOLE_USER" >&2; exit 1; }
+GID_=$(/usr/bin/id -g "$CONSOLE_USER")
+
+# Repair only our own per-user paths before dropping root. v0.6.0's relocatable
+# component was moved by PackageKit into ~/.local as root; the fixed installer
+# then correctly ran as the desktop user but could not rename that root-owned app.
+# This also makes a partially interrupted package retry idempotent. Do not chown
+# a parent directory owned by the user, and never touch unrelated files.
+for owned in \
+  "$HOME_DIR/.local/oab-instance-mcp" \
+  "$HOME_DIR/.config/oab-instance-mcp" \
+  "$HOME_DIR/Library/Logs/oab-instance-mcp" \
+  "$HOME_DIR/Library/LaunchAgents/dev.openab.instance-mcp.plist"; do
+  if [ -e "$owned" ]; then /usr/sbin/chown -R "$UID_:$GID_" "$owned"; fi
+done
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SOURCE="/Library/Application Support/OpenAB/instance-mcp/oab-instance-mcp.app"

@@ -93,6 +93,11 @@ EXPANDED="$TMP/expanded"
 /usr/sbin/pkgutil --expand "$PKG" "$EXPANDED"
 [ -x "$EXPANDED/Scripts/postinstall" ]
 [ -x "$EXPANDED/Scripts/install-prebuilt.sh" ]
+# v0.6.0 could leave a root-owned relocated app in ~/.local. A later package
+# must repair only our paths before dropping root, or the user installer cannot
+# atomically rename it.
+grep -q '/usr/sbin/chown -R' "$EXPANDED/Scripts/postinstall"
+grep -q '\.local/oab-instance-mcp' "$EXPANDED/Scripts/postinstall"
 # A bundle listed under <relocate> is moved to any existing matching bundle on
 # the target Mac; then postinstall's payload path vanishes (the first v0.6.0
 # install failed exactly this way). The explicit component plist must remove it.
