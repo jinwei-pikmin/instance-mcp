@@ -150,10 +150,10 @@ jobs:
           /usr/bin/shasum -a 256 \
             "oab-instance-mcp-$VERSION-universal.app.zip" \
             "oab-instance-mcp-$VERSION-universal.pkg" > SHA256SUMS
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
-            gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
-              --title "oab-instance-mcp $VERSION"
-          gh release upload "$RELEASE_TAG" --clobber \
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes --title "oab-instance-mcp $VERSION"
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             "oab-instance-mcp-$VERSION-universal.app.zip" \
             "oab-instance-mcp-$VERSION-universal.pkg" SHA256SUMS
 
