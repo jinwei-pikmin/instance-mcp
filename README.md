@@ -164,6 +164,32 @@ Verified 2026-09-26 end to end on macmini against the openab-pty runtime (PR #38
 `sys_info screenshot mouse key osascript instance_status`, `exec` refused, `sys_info` answered,
 `DELETE /attach/{id}` detached.
 
+## Download and install
+
+Tagged releases publish a universal, Developer-ID-signed and Apple-notarized installer:
+
+1. Download `oab-instance-mcp-VERSION-universal.pkg` from
+   [GitHub Releases](https://github.com/openabdev/instance-mcp/releases).
+2. Sign into Tailscale and keep a desktop user logged in.
+3. Double-click the package. It auto-detects your Tailscale login/name, preserves or creates the
+   bearer token, installs the LaunchAgent, detects the Playwright upstream, and configures
+   `tailscale serve :8444`.
+4. Once, enable Full Disk Access, Screen & System Audio Recording, and Accessibility for
+   **oab-instance-mcp** in System Settings → Privacy & Security. Future releases keep the same
+   Developer ID + bundle id, so these grants survive updates.
+5. Use the menu bar item to copy the MCP URL and bearer token into OpenAB Connect/Remote.
+
+The `.app.zip` beside the package is an advanced/manual artifact. After unzipping:
+
+```sh
+/path/to/oab-instance-mcp.app/Contents/Resources/install-prebuilt.sh \
+  /path/to/oab-instance-mcp.app --allow-login auto
+```
+
+The installer never re-signs the app: doing so would change the identity TCC grants are bound to.
+See [`docs/releasing.md`](docs/releasing.md) for artifacts, signing/notarization, required secrets,
+local packaging smoke, and the current first-release signing blocker.
+
 ## TCC grants survive re-deploys only if the signature does
 
 Screen Recording, Accessibility and Full Disk Access are keyed on the **code-signing identity +

@@ -1,0 +1,29 @@
+#!/bin/bash
+# Installer.app runs package scripts as root. Install/configure for the human who
+# is actually logged into the Aqua session, not root — screenshot/input tools and
+# the menu bar require that session, and the token belongs in that user's home.
+set -euo pipefail
+
+CONSOLE_USER=$(/usr/bin/stat -f '%Su' /dev/console)
+case "$CONSOLE_USER" in
+  ''|root|loginwindow|_mbsetupuser)
+    echo "oab-instance-mcp: no logged-in desktop user; sign in, then run the package again" >&2
+    exit 1
+    ;;
+esac
+UID_=$(/usr/bin/id -u "$CONSOLE_USER")
+HOME_DIR=$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory | \
+  /usr/bin/sed 's/^NFSHomeDirectory: //')
+[ -d "$HOME_DIR" ] || { echo "oab-instance-mcp: home not found for $CONSOLE_USER" >&2; exit 1; }
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+SOURCE="/Library/Application Support/OpenAB/instance-mcp/oab-instance-mcp.app"
+HELPER="$SCRIPT_DIR/install-prebuilt.sh"
+[ -d "$SOURCE" ] || { echo "oab-instance-mcp: package payload app is missing" >&2; exit 1; }
+[ -x "$HELPER" ] || { echo "oab-instance-mcp: package installer helper is missing" >&2; exit 1; }
+
+# `asuser` places launchctl/Tailscale in the GUI bootstrap namespace; sudo drops
+# filesystem/process identity. The helper itself never needs root.
+exec /bin/launchctl asuser "$UID_" /usr/bin/sudo -H -u "$CONSOLE_USER" \
+  /usr/bin/env HOME="$HOME_DIR" USER="$CONSOLE_USER" LOGNAME="$CONSOLE_USER" \
+  "$HELPER" "$SOURCE" --allow-login auto

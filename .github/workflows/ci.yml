@@ -40,6 +40,8 @@ jobs:
         run: swift --version
       - name: Build
         run: swift build
+      - name: Packaging smoke (unsigned; release signing is tag-only)
+        run: scripts/test-packaging.sh .build/debug/oab-instance-mcp
       - name: Test
         # OsascriptToolTests actually executes /usr/bin/osascript. Basic
         # scripts don't need TCC grants, but headless-runner behavior is
