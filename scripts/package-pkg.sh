@@ -34,15 +34,25 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 PAYLOAD="$TMP/payload"
 SCRIPTS="$TMP/scripts"
+COMPONENTS="$TMP/components.plist"
 mkdir -p "$PAYLOAD/Library/Application Support/OpenAB/instance-mcp" "$SCRIPTS" "$(dirname "$OUT")"
 /usr/bin/ditto "$APP" "$PAYLOAD/Library/Application Support/OpenAB/instance-mcp/oab-instance-mcp.app"
 cp "$ROOT/scripts/install-prebuilt.sh" "$SCRIPTS/install-prebuilt.sh"
 cp "$ROOT/scripts/pkg/postinstall" "$SCRIPTS/postinstall"
 chmod 755 "$SCRIPTS/install-prebuilt.sh" "$SCRIPTS/postinstall"
 
+# Without an explicit component property list, pkgbuild marks the nested .app as
+# relocatable. PackageKit then sees an existing copy under ~/.local and moves the
+# payload there instead of /Library/Application Support; postinstall cannot find
+# its source and fails. Pin the payload path — install-prebuilt performs the
+# intentional per-user copy after dropping root.
+/usr/bin/pkgbuild --analyze --root "$PAYLOAD" "$COMPONENTS" >/dev/null
+/usr/libexec/PlistBuddy -c 'Set :0:BundleIsRelocatable false' "$COMPONENTS"
+
 ARGS=(
   --root "$PAYLOAD"
   --scripts "$SCRIPTS"
+  --component-plist "$COMPONENTS"
   --identifier "$IDENTIFIER"
   --version "$VERSION"
   --install-location /

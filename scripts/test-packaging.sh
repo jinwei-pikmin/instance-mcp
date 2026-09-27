@@ -93,6 +93,13 @@ EXPANDED="$TMP/expanded"
 /usr/sbin/pkgutil --expand "$PKG" "$EXPANDED"
 [ -x "$EXPANDED/Scripts/postinstall" ]
 [ -x "$EXPANDED/Scripts/install-prebuilt.sh" ]
+# A bundle listed under <relocate> is moved to any existing matching bundle on
+# the target Mac; then postinstall's payload path vanishes (the first v0.6.0
+# install failed exactly this way). The explicit component plist must remove it.
+if /usr/bin/sed -n '/<relocate>/,/<\/relocate>/p' "$EXPANDED/PackageInfo" | /usr/bin/grep -q '<bundle'; then
+  echo "packaging test: app is still marked relocatable" >&2
+  exit 1
+fi
 /bin/bash -n "$EXPANDED/Scripts/postinstall"
 /bin/bash -n "$EXPANDED/Scripts/install-prebuilt.sh"
 
