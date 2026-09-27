@@ -1,0 +1,176 @@
+name: Release macOS installer
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing v* tag to release (for retry only)"
+        required: true
+        type: string
+
+# Release is the only workflow allowed to write repository contents. It never
+# runs PR-controlled code with secrets: push tags and manual dispatch only.
+permissions:
+  contents: write
+
+concurrency:
+  group: instance-mcp-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Universal app + signed/notarized pkg
+    runs-on: macos-15
+    environment: release
+    env:
+      EXPECTED_TEAM_ID: 6LPQNY95AQ
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      APP_CERT_P12_B64: ${{ secrets.MACOS_APP_CERT_P12_BASE64 }}
+      APP_CERT_PASSWORD: ${{ secrets.MACOS_APP_CERT_PASSWORD }}
+      APP_SIGN_IDENTITY: ${{ secrets.MACOS_APP_SIGN_IDENTITY }}
+      INSTALLER_CERT_P12_B64: ${{ secrets.MACOS_INSTALLER_CERT_P12_BASE64 }}
+      INSTALLER_CERT_PASSWORD: ${{ secrets.MACOS_INSTALLER_CERT_PASSWORD }}
+      INSTALLER_SIGN_IDENTITY: ${{ secrets.MACOS_INSTALLER_SIGN_IDENTITY }}
+      NOTARY_KEY_P8_B64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+      NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Validate tag and release secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "tag must be vMAJOR.MINOR.PATCH" >&2; exit 64;; esac
+          for var in APP_CERT_P12_B64 APP_CERT_PASSWORD APP_SIGN_IDENTITY \
+                     INSTALLER_CERT_P12_B64 INSTALLER_CERT_PASSWORD INSTALLER_SIGN_IDENTITY \
+                     NOTARY_KEY_P8_B64 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            [ -n "${!var:-}" ] || { echo "missing release secret: $var" >&2; exit 78; }
+          done
+          case "$APP_SIGN_IDENTITY" in "Developer ID Application:"*) ;; *) echo "MACOS_APP_SIGN_IDENTITY must be Developer ID Application" >&2; exit 78;; esac
+          case "$INSTALLER_SIGN_IDENTITY" in "Developer ID Installer:"*) ;; *) echo "MACOS_INSTALLER_SIGN_IDENTITY must be Developer ID Installer" >&2; exit 78;; esac
+          VERSION=${RELEASE_TAG#v}
+          grep -q "let version = \"$VERSION\"" Sources/oab-instance-mcp/main.swift || {
+            echo "tag $RELEASE_TAG does not match the binary version source" >&2; exit 65; }
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "DIST=$RUNNER_TEMP/dist" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: swift test --skip OsascriptToolTests
+
+      - name: Build universal release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$DIST"
+          swift build -c release --arch arm64 --scratch-path "$RUNNER_TEMP/build-arm64"
+          swift build -c release --arch x86_64 --scratch-path "$RUNNER_TEMP/build-x86_64"
+          /usr/bin/lipo -create \
+            "$RUNNER_TEMP/build-arm64/release/oab-instance-mcp" \
+            "$RUNNER_TEMP/build-x86_64/release/oab-instance-mcp" \
+            -output "$DIST/oab-instance-mcp"
+          chmod 755 "$DIST/oab-instance-mcp"
+          /usr/bin/lipo -info "$DIST/oab-instance-mcp" | grep -q 'x86_64 arm64\|arm64 x86_64'
+          [ "$($DIST/oab-instance-mcp --version)" = "$VERSION" ]
+          scripts/assemble-app.sh "$DIST/oab-instance-mcp" "$DIST/oab-instance-mcp.app" "$VERSION"
+
+      - name: Import Developer ID certificates
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/release-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(/usr/bin/openssl rand -hex 24)
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+          # Preserve the search list even though this job is pinned to a GitHub-
+          # hosted runner; restoring it keeps the workflow safe if moved later.
+          /usr/bin/security list-keychains -d user | \
+            /usr/bin/sed -E 's/^[[:space:]]*"(.*)"$/\1/' > "$RUNNER_TEMP/original-keychains.txt"
+          /usr/bin/security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          /usr/bin/security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          /usr/bin/security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          printf '%s' "$APP_CERT_P12_B64" | /usr/bin/base64 -D > "$RUNNER_TEMP/app.p12"
+          printf '%s' "$INSTALLER_CERT_P12_B64" | /usr/bin/base64 -D > "$RUNNER_TEMP/installer.p12"
+          /usr/bin/security import "$RUNNER_TEMP/app.p12" -k "$KEYCHAIN" -P "$APP_CERT_PASSWORD" -T /usr/bin/codesign
+          /usr/bin/security import "$RUNNER_TEMP/installer.p12" -k "$KEYCHAIN" -P "$INSTALLER_CERT_PASSWORD" -T /usr/bin/pkgbuild
+          /usr/bin/security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          ORIGINAL=()
+          while IFS= read -r item; do [ -z "$item" ] || ORIGINAL+=("$item"); done < "$RUNNER_TEMP/original-keychains.txt"
+          /usr/bin/security list-keychains -d user -s "$KEYCHAIN" "${ORIGINAL[@]}"
+          /usr/bin/security find-identity -v "$KEYCHAIN"
+
+      - name: Sign and notarize app
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$DIST/oab-instance-mcp.app"
+          /usr/bin/codesign --force --deep --options runtime --timestamp \
+            --keychain "$KEYCHAIN" --sign "$APP_SIGN_IDENTITY" "$APP"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP"
+          TEAM=$(/usr/bin/codesign -dvv "$APP" 2>&1 | /usr/bin/sed -n 's/^TeamIdentifier=//p')
+          [ "$TEAM" = "$EXPECTED_TEAM_ID" ] || { echo "wrong app team: $TEAM" >&2; exit 65; }
+          /usr/bin/ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/app-for-notary.zip"
+          printf '%s' "$NOTARY_KEY_P8_B64" | /usr/bin/base64 -D > "$RUNNER_TEMP/AuthKey.p8"
+          xcrun notarytool submit "$RUNNER_TEMP/app-for-notary.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          rm -f "$DIST/oab-instance-mcp-$VERSION-universal.app.zip"
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP" \
+            "$DIST/oab-instance-mcp-$VERSION-universal.app.zip"
+
+      - name: Build, sign, and notarize installer pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="$DIST/oab-instance-mcp-$VERSION-universal.pkg"
+          EXPECT_TEAM="$EXPECTED_TEAM_ID" PKG_SIGN_IDENTITY="$INSTALLER_SIGN_IDENTITY" \
+            PKG_KEYCHAIN="$KEYCHAIN" \
+            scripts/package-pkg.sh "$DIST/oab-instance-mcp.app" "$PKG" "$VERSION"
+          /usr/sbin/pkgutil --check-signature "$PKG" | grep -q 'Developer ID Installer'
+          xcrun notarytool submit "$PKG" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" --wait
+          xcrun stapler staple "$PKG"
+          xcrun stapler validate "$PKG"
+          /usr/sbin/spctl -a -vv --type install "$PKG"
+          scripts/verify-release.sh \
+            "$DIST/oab-instance-mcp-$VERSION-universal.app.zip" "$PKG" "$EXPECTED_TEAM_ID"
+
+      - name: Checksums and release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$DIST"
+          /usr/bin/shasum -a 256 \
+            "oab-instance-mcp-$VERSION-universal.app.zip" \
+            "oab-instance-mcp-$VERSION-universal.pkg" > SHA256SUMS
+          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes \
+              --title "oab-instance-mcp $VERSION"
+          gh release upload "$RELEASE_TAG" --clobber \
+            "oab-instance-mcp-$VERSION-universal.app.zip" \
+            "oab-instance-mcp-$VERSION-universal.pkg" SHA256SUMS
+
+      - name: Clean signing material
+        if: always()
+        shell: bash
+        run: |
+          rm -f "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/installer.p12" \
+                "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/app-for-notary.zip"
+          if [ -f "$RUNNER_TEMP/original-keychains.txt" ]; then
+            ORIGINAL=()
+            while IFS= read -r item; do [ -z "$item" ] || ORIGINAL+=("$item"); done < "$RUNNER_TEMP/original-keychains.txt"
+            if [ "${#ORIGINAL[@]}" -gt 0 ]; then
+              /usr/bin/security list-keychains -d user -s "${ORIGINAL[@]}" || true
+            fi
+            rm -f "$RUNNER_TEMP/original-keychains.txt"
+          fi
+          if [ -n "${KEYCHAIN:-}" ] && [ -f "$KEYCHAIN" ]; then
+            /usr/bin/security delete-keychain "$KEYCHAIN" || true
+          fi

@@ -1,4 +1,5 @@
 import ApplicationServices
+import Foundation
 import XCTest
 @testable import InstanceMCPCore
 
