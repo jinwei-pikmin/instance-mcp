@@ -50,7 +50,14 @@ sleep 1
 curl -fsS "http://127.0.0.1:$local_port/healthz" >/dev/null && echo "healthz ok"
 
 echo "==> tailscale serve :$https_port -> 127.0.0.1:$local_port"
-if ! tailscale serve --bg --https="$https_port" "http://127.0.0.1:$local_port"; then
+if tailscale serve status --json 2>/dev/null | python3 -c '
+import json, sys
+port, target = sys.argv[1], sys.argv[2]
+web = (json.load(sys.stdin) or {}).get("Web") or {}
+sys.exit(0 if any(k.endswith(":" + port) and any(h.get("Proxy") == target for h in (v.get("Handlers") or {}).values())
+                  for k, v in web.items()) else 1)' "$https_port" "http://127.0.0.1:$local_port"; then
+  echo "already configured"
+elif ! tailscale serve --bg --https="$https_port" "http://127.0.0.1:$local_port"; then
   echo >&2
   echo "tailscale serve failed (output above). Common causes:" >&2
   echo "  - Serve/HTTPS not enabled on the tailnet: open the link above as a tailnet admin" >&2
