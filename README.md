@@ -32,7 +32,7 @@ flowchart LR
             input["Input<br/>CGEvent mouse / keyboard"]
             apps["Apps<br/>osascript / JXA"]
         end
-        tcc{{"TCC grants, once, on the Mac's own screen<br/>Screen Recording · Accessibility · Automation<br/>bound to bundle id dev.openab.instance-mcp"}}
+        tcc{{"TCC grants, once, on the Mac's own screen<br/>Screen Recording · Accessibility · Full Disk Access<br/>bound to bundle id dev.openab.instance-mcp"}}
     end
 
     cli -- "HTTPS · MCP Streamable HTTP" --> s8444
@@ -174,10 +174,12 @@ Tagged releases publish a universal, Developer-ID-signed and Apple-notarized ins
 3. Double-click the package. It auto-detects your Tailscale login/name, preserves or creates the
    bearer token, installs the LaunchAgent, detects the Playwright upstream, and configures
    `tailscale serve :8444`.
-4. Once, enable Full Disk Access, Screen & System Audio Recording, and Accessibility for
-   **oab-instance-mcp** in System Settings → Privacy & Security. Future releases keep the same
-   Developer ID + bundle id, so these grants survive updates.
-5. Use the menu bar item to copy the MCP URL and bearer token into OpenAB Connect/Remote.
+4. On first launch, the **Set Up Mac Permissions** window opens once if anything is missing. Use
+   each row's Open Settings button, return to the wizard, then Test Again. Grant only what you need:
+   Full Disk Access, Screen & System Audio Recording, and/or Accessibility. Browser tools work
+   without any of them. Future releases keep the same Developer ID + bundle id, so grants survive.
+5. The same wizard remains available from the menu bar as **Set Up Permissions…**; use the menu
+   item to copy the MCP URL and bearer token into OpenAB Connect/Remote.
 
 The `.app.zip` beside the package is an advanced/manual artifact. After unzipping:
 
@@ -249,10 +251,13 @@ kiro-cli mcp add --name macmini-mcp --url https://<host>.<tailnet>.ts.net:8444/m
 ## Menu bar
 
 With `--menu-bar` (deploy.sh sets it) the agent shows a status item: version, the public MCP URL
-(click to copy), a masked bearer token line (click to copy the full token), ✓/✗ for Screen
-Recording and Accessibility (click ✗ to open the pane), session / call counters with the last tool
-call, Open Log, Restart, and Quit (which boots the launchd job out so KeepAlive does not bring it
-back). The icon fills briefly on each tool call.
+(click to copy), a masked bearer token line (click to copy the full token), live ✓/✗/? rows for
+Screen Recording, Accessibility, and Full Disk Access, **Set Up Permissions…** (the same window
+that auto-shows once on first launch when anything is missing), session / call counters with the
+last tool call, Open Log, Restart, and Quit. The setup window opens the exact System Settings pane
+for each permission and re-tests when the app becomes active or the user clicks Test Again; it
+never polls screenshot or triggers permission prompts by itself. The icon fills briefly on each
+tool call.
 
 ## Operate
 

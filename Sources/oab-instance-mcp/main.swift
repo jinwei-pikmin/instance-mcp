@@ -4,7 +4,7 @@ import CoreGraphics
 import Foundation
 import InstanceMCPCore
 
-let version = "0.6.2"
+let version = "0.6.3"
 
 struct Options {
     var host = "127.0.0.1"
@@ -145,10 +145,13 @@ do {
 } catch {
     fputs("failed to start listener: \(error)\n", stderr); exit(2)
 }
+let startupPermissions = PermissionProbe.current()
 log("oab-instance-mcp \(version) starting on http://\(opts.host):\(opts.port)\(opts.path) " +
     "auth=[logins:\(opts.allowLogins.sorted().joined(separator: ",")) token:\(opts.token != nil) insecure-local:\(opts.insecureLocal)] " +
     "attach=\(opts.attach) upstreams=[\(opts.upstreams.map { $0.0 }.joined(separator: ","))] " +
-    "screen_recording=\(CGPreflightScreenCaptureAccess()) accessibility=\(AXIsProcessTrusted())")
+    "screen_recording=\(startupPermissions.screenRecording.isGranted) " +
+    "accessibility=\(startupPermissions.accessibility.isGranted) " +
+    "full_disk_access=\(startupPermissions.fullDiskAccess.isGranted)")
 http.start()
 
 signal(SIGPIPE, SIG_IGN)
@@ -164,6 +167,9 @@ if opts.menuBar {
     let publicURL = opts.publicURL ?? "http://\(opts.host):\(opts.port)\(opts.path)"
     statusItem = MainActor.assumeIsolated {
         StatusItemController(version: version, url: publicURL, logPath: logPath, token: opts.token)
+    }
+    DispatchQueue.main.async {
+        MainActor.assumeIsolated { statusItem?.showPermissionSetupIfNeeded() }
     }
     app.run()
 } else {

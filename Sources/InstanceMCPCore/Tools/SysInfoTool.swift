@@ -8,8 +8,8 @@ public struct SysInfoTool: Tool {
     public let name = "sys_info"
     public let description = """
         Describe this Mac: hostname, macOS version, hardware, logged-in GUI user, displays, \
-        Tailscale addresses, and which TCC permissions (Screen Recording, Accessibility) the \
-        agent currently holds. Call this first to learn what the other tools can do here.
+        Tailscale addresses, and which TCC permissions (Screen Recording, Accessibility, Full Disk \
+        Access) the agent currently holds. Call this first to learn what the other tools can do here.
         """
     public let inputSchema: JSONValue = ["type": "object", "properties": [:]]
 
@@ -42,9 +42,18 @@ public struct SysInfoTool: Tool {
             ]
         }
 
-        // TCC. CGPreflightScreenCaptureAccess is the non-prompting check.
-        let screenRecording = CGPreflightScreenCaptureAccess()
-        let accessibility = AXIsProcessTrusted()
+        // TCC. Public non-prompting checks for screen/AX; FDA is an actual
+        // open+close of a protected database (no content read).
+        let permissions = PermissionProbe.current()
+        let screenRecording = permissions.screenRecording.isGranted
+        let accessibility = permissions.accessibility.isGranted
+        let fullDiskAccess = permissions.fullDiskAccess.isGranted
+        let fullDiskAccessState: String
+        switch permissions.fullDiskAccess {
+        case .granted: fullDiskAccessState = "granted"
+        case .denied: fullDiskAccessState = "denied"
+        case .unknown: fullDiskAccessState = "unknown"
+        }
 
         let console = consoleUser()
         let tail = tailnetAddresses()
@@ -62,6 +71,8 @@ public struct SysInfoTool: Tool {
             "permissions": [
                 "screen_recording": .bool(screenRecording),
                 "accessibility": .bool(accessibility),
+                "full_disk_access": .bool(fullDiskAccess),
+                "full_disk_access_state": .string(fullDiskAccessState),
             ],
             "uptime_secs": .number(pi.systemUptime.rounded()),
         ]
@@ -73,9 +84,10 @@ public struct SysInfoTool: Tool {
             "\(Int(d["points"]?["width"]?.doubleValue ?? 0))×\(Int(d["points"]?["height"]?.doubleValue ?? 0))pt\(d["main"]?.boolValue == true ? " (main)" : "")"
         }.joined(separator: ", "))
         lines.append("tailscale: \(tail.isEmpty ? "none" : tail.joined(separator: ", "))")
-        lines.append("permissions: screen_recording=\(screenRecording) accessibility=\(accessibility)")
+        lines.append("permissions: screen_recording=\(screenRecording) accessibility=\(accessibility) full_disk_access=\(fullDiskAccessState)")
         if !screenRecording { lines.append("→ screenshot will fail until Screen Recording is granted to oab-instance-mcp") }
         if !accessibility { lines.append("→ mouse/key will fail until Accessibility is granted to oab-instance-mcp") }
+        if !fullDiskAccess { lines.append("→ protected Mail/Messages/Safari files will fail until Full Disk Access is granted to oab-instance-mcp") }
         lines.append("agent \(agentVersion)")
         return ToolResult(content: [.text(lines.joined(separator: "\n"))], structured: structured)
     }
