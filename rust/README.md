@@ -10,7 +10,7 @@ build, so callers (kiro-cli, claude, openab) configure it exactly like the Mac o
 | Auth: `--allow-login` AND bearer token, `--insecure-local` | ✅ | ✅ same decision table |
 | `sys_info` | ✅ | ✅ `/proc`, `/sys`, os-release, session env, tailnet IPs |
 | `exec`, `exec_start/poll/list/cancel` | ✅ `zsh -f` | ✅ `bash --noprofile --norc`, `setsid` + `killpg` |
-| `screenshot` / `mouse` / `key` | ✅ | ⏳ phase 3 (xdg-desktop-portal ScreenCast/RemoteDesktop on GNOME/KDE, grim/ydotool on wlroots) |
+| `screenshot` / `mouse` / `key` | ✅ | ✅ xdg-desktop-portal (GNOME verified; KDE should work, untested); same schema and point coordinates. wlroots (grim/ydotool) not yet |
 | `osascript` | ✅ | — no Linux equivalent; use `exec` (`gdbus`, `xdg-open`) |
 | Reverse attach (`POST/GET /attach`, `DELETE /attach/{id}`, `--no-attach`) | ✅ | ✅ same grant API, close-code policy and backoff; replies are sent concurrently by JSON-RPC id |
 | `--upstream` (re-serve Playwright MCP as `browser_*`) | ✅ | ⏳ |
@@ -18,8 +18,24 @@ build, so callers (kiro-cli, claude, openab) configure it exactly like the Mac o
 Reverse attach: a human `POST /attach {runtime, session, profile, ttl_secs, secret | admin_credential}`
 with the same credential as `/mcp`; this machine dials `{runtime}/tools/attach/{session}` over
 `ws://` or `wss://` (rustls, webpki roots) and serves MCP on that socket scoped to the profile.
-Under `sandbox` there is no `exec*`, so on Linux today a lent sandbox sees only `sys_info`
-until screenshot/input or `--upstream` land.
+Under `sandbox` there is no `exec*`; a lent sandbox gets `sys_info`, `screenshot`, `mouse`, `key`.
+
+Desktop (portal backend), verified on GNOME 50 Wayland at 5/3 fractional scaling:
+
+- **Consent once.** The first desktop call shows GNOME's "Remote Desktop" dialog on this
+  machine's screen; turn on *Allow Remote Interaction* and Share. The restore token is kept in
+  `~/.config/oab-instance-mcp/portal-restore-token` (0600), so later sessions start silently.
+  Delete it to revoke. The session closes after 5 min idle (the top-bar indicator goes away).
+- **Screenshots** go through the Screenshot portal, which writes a PNG into `~/Pictures`; the
+  daemon reads and deletes that file.
+- **Pointer on fractional scaling.** The portal validates absolute motion against the logical
+  stream size while Mutter reads it in physical pixels, so the daemon moves absolutely as far as
+  allowed and finishes with relative motion. Monitor scales come from `org.gnome.Mutter.DisplayConfig`.
+- **Typing.** ASCII goes as keysyms; other characters (CJK, accents, symbols) go through the
+  IBus/GTK Unicode entry (`ctrl+shift+u`, hex, space), which GTK/Qt apps and browsers accept.
+- **Shortcuts** use ctrl; `cmd` is accepted as an alias for ctrl.
+- `--no-desktop` turns the three tools off; they are off automatically without a graphical session.
+- The service runs with `KillMode=process`, so apps opened via `exec` survive restarts.
 
 Job logs: `$XDG_STATE_HOME/oab-instance-mcp/jobs/<job_id>.out|.err` (default `~/.local/state/…`).
 

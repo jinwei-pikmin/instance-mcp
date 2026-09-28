@@ -15,6 +15,7 @@ use auth::AuthPolicy;
 use mcp::{McpServer, Tool};
 use tools::exec::ExecTool;
 use tools::jobs::{ExecCancelTool, ExecListTool, ExecPollTool, ExecStartTool, JobRegistry};
+use tools::screen::{KeyTool, MouseTool, ScreenshotTool};
 use tools::sysinfo::SysInfoTool;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,15 +39,16 @@ struct Options {
     insecure_local: bool,
     quiet: bool,
     attach: bool,
+    desktop: bool,
 }
 
 fn usage() -> ! {
     println!(
-        "oab-instance-mcp {VERSION} (Rust, {os}) — MCP server exposing this machine (exec / sys_info)
+        "oab-instance-mcp {VERSION} (Rust, {os}) — MCP server exposing this machine (exec / screenshot / mouse / key / sys_info)
 
 USAGE: oab-instance-mcp [--host 127.0.0.1] [--port 8795] [--path /mcp]
                         [--allow-login <email>]... [--token <str> | --token-file <path>]
-                        [--insecure-local] [--quiet] [--no-attach]
+                        [--insecure-local] [--quiet] [--no-attach] [--no-desktop]
 
 Auth (at least one required unless --insecure-local):
   --allow-login   Tailscale login (from `tailscale serve`'s Tailscale-User-Login header). Repeatable.
@@ -58,6 +60,9 @@ Auth (at least one required unless --insecure-local):
   --no-attach     Disable the reverse-attach plane (POST/GET /attach, DELETE /attach/{{id}}):
                   the human-credentialed endpoint through which Connect / Remote lends this
                   machine to one openab-pty session (this machine dials the pod).
+
+  --no-desktop    Do not offer screenshot / mouse / key even inside a desktop session.
+                  (They are offered automatically when the process sees a graphical session.)
 
 Not yet in the Rust build: --upstream, --menu-bar.
 
@@ -79,6 +84,7 @@ fn parse_args() -> Options {
         insecure_local: false,
         quiet: false,
         attach: true,
+        desktop: true,
     };
     let mut args = std::env::args().skip(1);
     let next = |flag: &str, args: &mut dyn Iterator<Item = String>| {
@@ -103,6 +109,7 @@ fn parse_args() -> Options {
             "--insecure-local" => o.insecure_local = true,
             "--quiet" => o.quiet = true,
             "--no-attach" => o.attach = false,
+            "--no-desktop" => o.desktop = false,
             "--upstream" | "--menu-bar" | "--public-url" => {
                 eprintln!("{a} is not supported by the Rust build yet");
                 std::process::exit(64)
@@ -138,8 +145,8 @@ fn parse_args() -> Options {
     o
 }
 
-fn instructions() -> String {
-    format!(
+fn instructions(desktop: bool) -> String {
+    let mut s = format!(
         "You are operating a real {os} machine ({host}) as its logged-in user; a human may be using it. \
          `exec` is a plain `{shell} -c` shell as that user and is the right tool for files and commands; \
          for long jobs (builds) that outlive one request use `exec_start` then `exec_poll`/`exec_cancel`. \
@@ -147,7 +154,19 @@ fn instructions() -> String {
         os = platform::backend().os_label(),
         host = platform::backend().hostname(),
         shell = platform::backend().shell().0,
-    )
+    );
+    if desktop {
+        s.push_str(
+            " For the desktop, work in a see→act→see loop: `screenshot`, decide, `mouse`/`key`, then \
+             `screenshot` again to confirm — never assume an action landed. `screenshot` at the default \
+             scale 1.0 returns one pixel per display point and `mouse` takes display points, so image \
+             pixel (x,y) is the click target. To read small text pass `region: {x,y,width,height}` with \
+             `scale: 2`; the crop's pixel (px,py) is point (region.x + px/2, region.y + py/2). Shortcuts \
+             use ctrl on Linux. The first desktop call may wait for a human to approve remote control \
+             on this machine's screen.",
+        );
+    }
+    s
 }
 
 #[tokio::main]
@@ -172,7 +191,7 @@ async fn main() {
         agent_version: VERSION,
         tool_names: OnceLock::new(),
     });
-    let tools: Vec<Arc<dyn Tool>> = vec![
+    let mut tools: Vec<Arc<dyn Tool>> = vec![
         sys_info.clone(),
         Arc::new(ExecTool),
         Arc::new(ExecStartTool(jobs.clone())),
@@ -180,7 +199,22 @@ async fn main() {
         Arc::new(ExecListTool(jobs.clone())),
         Arc::new(ExecCancelTool(jobs)),
     ];
-    let server = McpServer::new("oab-instance-mcp", VERSION, Some(instructions()), tools);
+    let desktop = if opts.desktop {
+        platform::backend().desktop()
+    } else {
+        None
+    };
+    if let Some(d) = &desktop {
+        tools.push(Arc::new(ScreenshotTool(d.clone())));
+        tools.push(Arc::new(MouseTool(d.clone())));
+        tools.push(Arc::new(KeyTool(d.clone())));
+    }
+    let server = McpServer::new(
+        "oab-instance-mcp",
+        VERSION,
+        Some(instructions(desktop.is_some())),
+        tools,
+    );
     let _ = sys_info.tool_names.set(server.tool_names());
     let tool_list = server.tool_names().join(",");
     let attach = opts

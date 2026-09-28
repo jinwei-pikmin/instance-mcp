@@ -2,7 +2,7 @@
 //! `MCPHTTPEndpoint.swift`: every POST gets a plain `application/json` reply, never an SSE
 //! stream; GET → 405. `Mcp-Session-Id` is issued on `initialize` and checked afterwards.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -25,7 +25,7 @@ pub struct Endpoint {
     pub path: String,
     pub server: McpServer,
     pub auth: AuthPolicy,
-    sessions: Mutex<HashSet<String>>,
+    sessions: Mutex<Sessions>,
     /// Reverse-attach grants (`/attach`). None ⇒ those routes answer 404.
     attach: Option<Arc<AttachManager>>,
 }
@@ -41,9 +41,34 @@ impl Endpoint {
             path,
             server,
             auth,
-            sessions: Mutex::new(HashSet::new()),
+            sessions: Mutex::new(Sessions::default()),
             attach,
         })
+    }
+}
+
+/// Issued `Mcp-Session-Id`s, oldest first. Bounded: clients such as a screen-watching
+/// poller open a session per poll and never DELETE it; an evicted client just gets 404 and
+/// re-initializes, as the spec intends.
+#[derive(Default)]
+struct Sessions {
+    order: VecDeque<String>,
+}
+
+impl Sessions {
+    const MAX: usize = 1024;
+
+    fn insert(&mut self, sid: String) {
+        if self.order.len() >= Self::MAX {
+            self.order.pop_front();
+        }
+        self.order.push_back(sid);
+    }
+    fn contains(&self, sid: &str) -> bool {
+        self.order.iter().any(|s| s == sid)
+    }
+    fn remove(&mut self, sid: &str) {
+        self.order.retain(|s| s != sid);
     }
 }
 
@@ -341,6 +366,18 @@ mod tests {
             b = b.header("mcp-session-id", s);
         }
         b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[test]
+    fn sessions_are_bounded_oldest_first() {
+        let mut s = Sessions::default();
+        for i in 0..Sessions::MAX + 5 {
+            s.insert(i.to_string());
+        }
+        assert!(!s.contains("0") && !s.contains("4"));
+        assert!(s.contains("5") && s.contains(&(Sessions::MAX + 4).to_string()));
+        s.remove("5");
+        assert!(!s.contains("5"));
     }
 
     #[tokio::test]

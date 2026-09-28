@@ -3,6 +3,7 @@
 //! The implementation is selected at build time with `#[cfg(target_os)]`; `backend()`
 //! returns it.
 
+pub mod desktop;
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -10,8 +11,11 @@ mod linux;
 compile_error!("only the Linux backend exists so far; macOS still ships the Swift build");
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::Value;
+
+use desktop::Desktop;
 
 pub trait PlatformBackend: Send + Sync {
     /// Human name of the OS family, used in tool descriptions ("Linux", "macOS").
@@ -32,6 +36,10 @@ pub trait PlatformBackend: Send + Sync {
 
     /// Where background job logs go.
     fn job_log_dir(&self) -> PathBuf;
+
+    /// Screen and input, if this host has a desktop we can drive. None ⇒ the screenshot /
+    /// mouse / key tools are not registered (headless nodes keep exec and sys_info).
+    fn desktop(&self) -> Option<Arc<dyn Desktop>>;
 }
 
 #[cfg(target_os = "linux")]

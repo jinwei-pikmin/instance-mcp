@@ -99,11 +99,7 @@ pub fn rpc_error(id: Value, e: &RpcError) -> Value {
 
 pub enum Content {
     Text(String),
-    #[allow(dead_code)] // emitted by the screenshot backend
-    Image {
-        data_b64: String,
-        mime_type: String,
-    },
+    Image { data_b64: String, mime_type: String },
 }
 
 pub struct ToolResult {

@@ -1,9 +1,14 @@
-//! Linux backend: host facts from /proc, /sys, /etc and the session environment.
+//! Linux backend: host facts from /proc, /sys, /etc and the session environment; the
+//! desktop (screenshot / input) through xdg-desktop-portal.
+
+mod portal;
 
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::{json, Value};
 
+use super::desktop::Desktop;
 use super::PlatformBackend;
 
 pub struct Linux;
@@ -26,7 +31,24 @@ impl PlatformBackend for Linux {
     }
 
     fn describe(&self, agent_version: &str, tool_names: &[&str]) -> (Value, Vec<String>) {
-        describe(&self.hostname(), agent_version, tool_names)
+        let desktop = self.desktop().map(|d| d.status());
+        describe(&self.hostname(), agent_version, tool_names, desktop)
+    }
+
+    /// Portal-backed desktop when this process is inside a graphical session (GNOME, KDE…).
+    /// wlroots compositors (sway, labwc) do not implement the RemoteDesktop portal; they
+    /// need a grim/ydotool backend, not written yet.
+    fn desktop(&self) -> Option<Arc<dyn Desktop>> {
+        static DESKTOP: OnceLock<Option<Arc<dyn Desktop>>> = OnceLock::new();
+        DESKTOP
+            .get_or_init(|| {
+                let has = |k| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+                let gui = has("WAYLAND_DISPLAY") || has("DISPLAY");
+                let bus = has("DBUS_SESSION_BUS_ADDRESS") || has("XDG_RUNTIME_DIR");
+                (gui && bus)
+                    .then(|| Arc::new(portal::Portal::new(config_dir())) as Arc<dyn Desktop>)
+            })
+            .clone()
     }
 
     /// `$XDG_STATE_HOME/oab-instance-mcp/jobs` (default `~/.local/state/...`).
@@ -36,6 +58,14 @@ impl PlatformBackend for Linux {
             .unwrap_or_else(|| PathBuf::from(crate::tools::exec::home_dir()).join(".local/state"));
         base.join("oab-instance-mcp/jobs")
     }
+}
+
+/// `$XDG_CONFIG_HOME/oab-instance-mcp` (default `~/.config/...`), where the token lives.
+fn config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(crate::tools::exec::home_dir()).join(".config"))
+        .join("oab-instance-mcp")
 }
 
 /// Home directory of `user` from the passwd database.
@@ -152,14 +182,18 @@ fn uptime_secs() -> f64 {
         .round()
 }
 
-fn describe(host: &str, agent_version: &str, tool_names: &[&str]) -> (Value, Vec<String>) {
+fn describe(
+    host: &str,
+    agent_version: &str,
+    tool_names: &[&str],
+    desktop: Option<String>,
+) -> (Value, Vec<String>) {
     let os = os_pretty();
     let hw = hardware();
     let sess = session();
     let user = user_name();
     let tail = super::tailnet_addresses();
     let gui = sess["gui_session"].as_bool().unwrap_or(false);
-    // Desktop tools are not in this build yet; say so plainly rather than let calls fail.
     let capabilities = json!({
         "exec": tool_names.contains(&"exec"),
         "screenshot": tool_names.contains(&"screenshot"),
@@ -175,7 +209,7 @@ fn describe(host: &str, agent_version: &str, tool_names: &[&str]) -> (Value, Vec
         "user": user,
         "session": sess,
         "gui_session": gui,
-        "displays": [],
+        "desktop": desktop,
         "tailscale_ips": tail,
         "capabilities": capabilities,
         "uptime_secs": uptime_secs(),
@@ -208,10 +242,12 @@ fn describe(host: &str, agent_version: &str, tool_names: &[&str]) -> (Value, Vec
         ),
         format!("tools: {}", tool_names.join(", ")),
     ];
-    if !tool_names.contains(&"screenshot") {
-        lines.push(
-            "→ screenshot / mouse / key are not available in this Linux build yet; use exec".into(),
-        );
+    match &desktop {
+        Some(d) => lines.push(format!("desktop: {d}")),
+        None => lines.push(
+            "→ no graphical session in the agent's environment: screenshot / mouse / key are off; use exec"
+                .into(),
+        ),
     }
     lines.push("→ osascript does not exist on Linux; use exec (e.g. gdbus, xdg-open)".into());
     lines.push(format!("agent {agent_version}"));
