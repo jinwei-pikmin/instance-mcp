@@ -24,7 +24,8 @@ use crate::log;
 use crate::mcp::{McpServer, ToolProfile};
 use client::{ClientHandle, Config, State};
 
-pub const MAX_TTL_SECS: i64 = 12 * 3600;
+/// Matches the Swift build (0.6.4): Connect / Remote offer 1, 2, 4, 12 and 24 h leases.
+pub const MAX_TTL_SECS: i64 = 24 * 3600;
 pub const DEFAULT_TTL_SECS: i64 = 3600;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -275,10 +276,12 @@ fn sandbox_instructions(profile: ToolProfile, base: Option<&str>) -> Option<Stri
 // MARK: - mint at the runtime's admin plane
 
 /// `POST {runtime as http(s)}/admin/sessions/{session}/tools-attach` with the admin
-/// credential; expects `201 {"secret": …, "expires_in_secs": …}`. The credential is used
+/// credential and body `{"ttl_secs": <requested>}`; expects `201 {"secret": …,
+/// "expires_in_secs": …}`. Without the body openab-pty mints its default hour and every
+/// longer lease silently shrinks to 1 h (fixed upstream in 0.6.4). The credential is used
 /// for this one request and dropped.
 fn mint_at_runtime() -> MintFn {
-    Arc::new(|runtime, session, credential, _ttl| {
+    Arc::new(|runtime, session, credential, ttl| {
         Box::pin(async move {
             let transport = |e: String| AttachError::MintFailed { status: 0, body: e };
             let https = runtime.scheme_str() == Some("wss");
@@ -287,7 +290,8 @@ fn mint_at_runtime() -> MintFn {
                 Some(if https { "https" } else { "http" }),
                 &format!("/admin/sessions/{session}/tools-attach"),
             );
-            let fut = http_post(&url, &credential, https);
+            let body = serde_json::json!({ "ttl_secs": ttl.as_secs() }).to_string();
+            let fut = http_post(&url, &credential, https, body);
             let (status, body) = tokio::time::timeout(Duration::from_secs(15), fut)
                 .await
                 .map_err(|_| transport("timed out".into()))?
@@ -318,9 +322,14 @@ fn mint_at_runtime() -> MintFn {
     })
 }
 
-/// Minimal one-shot HTTP/1.1 POST (no body) over plain TCP or rustls.
-async fn http_post(url: &str, bearer: &str, https: bool) -> Result<(u16, Vec<u8>), String> {
-    use http_body_util::{BodyExt, Empty};
+/// Minimal one-shot HTTP/1.1 POST of a JSON body over plain TCP or rustls.
+async fn http_post(
+    url: &str,
+    bearer: &str,
+    https: bool,
+    json: String,
+) -> Result<(u16, Vec<u8>), String> {
+    use http_body_util::{BodyExt, Full};
     use hyper::body::Bytes;
     use hyper_util::rt::TokioIo;
 
@@ -330,15 +339,16 @@ async fn http_post(url: &str, bearer: &str, https: bool) -> Result<(u16, Vec<u8>
     let req = hyper::Request::post(uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"))
         .header("host", uri.authority().map(|a| a.as_str()).unwrap_or(&host))
         .header("authorization", format!("Bearer {bearer}"))
-        .header("content-length", "0")
-        .body(Empty::<Bytes>::new())
+        .header("content-type", "application/json")
+        .header("content-length", json.len().to_string())
+        .body(Full::new(Bytes::from(json)))
         .map_err(|e| e.to_string())?;
 
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
         .map_err(|e| e.to_string())?;
 
-    async fn send<S>(io: S, req: hyper::Request<Empty<Bytes>>) -> Result<(u16, Vec<u8>), String>
+    async fn send<S>(io: S, req: hyper::Request<Full<Bytes>>) -> Result<(u16, Vec<u8>), String>
     where
         S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     {

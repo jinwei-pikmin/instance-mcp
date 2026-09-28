@@ -184,6 +184,10 @@ async fn bad_requests_are_400() {
             "ttl",
         ),
         (
+            json!({"runtime": "ws://h:1", "session": "s", "secret": "x", "ttl_secs": 86401}),
+            "ttl",
+        ),
+        (
             json!({"runtime": "ws://h:1", "session": "s"}),
             "exactly one",
         ),
@@ -323,9 +327,14 @@ async fn real_mint_speaks_the_admin_plane_contract() {
         head
     });
     let rt: Uri = format!("ws://127.0.0.1:{port}").parse().unwrap();
-    let m = (mint_at_runtime())(rt, "laptop".into(), "adm".into(), Duration::from_secs(3600))
-        .await
-        .unwrap();
+    let m = (mint_at_runtime())(
+        rt,
+        "laptop".into(),
+        "adm".into(),
+        Duration::from_secs(14400),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         (m.secret.as_str(), m.expires_in),
         ("fresh", Duration::from_secs(90))
@@ -340,6 +349,13 @@ async fn real_mint_speaks_the_admin_plane_contract() {
             .contains("authorization: bearer adm"),
         "{head}"
     );
+    // The requested lease travels to the runtime (upstream 0.6.4), as JSON.
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: application/json"),
+        "{head}"
+    );
+    assert!(head.ends_with(r#"{"ttl_secs":14400}"#), "{head}");
 }
 
 // MARK: - end to end against a fake openab-pty runtime
