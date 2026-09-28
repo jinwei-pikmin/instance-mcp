@@ -174,3 +174,54 @@ jobs:
           if [ -n "${KEYCHAIN:-}" ] && [ -f "$KEYCHAIN" ]; then
             /usr/bin/security delete-keychain "$KEYCHAIN" || true
           fi
+
+  linux:
+    name: Linux hands node tarball (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        working-directory: poc/reverse-attach-linux
+        run: |
+          cargo build --release
+          bash smoke.sh
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=${RELEASE_TAG#v}
+          NAME="oab-instance-mcp-$VERSION-linux-${{ matrix.arch }}"
+          mkdir -p "$NAME"
+          cp poc/reverse-attach-linux/target/release/reverse-attach "$NAME/oab-instance-mcp"
+          cp poc/reverse-attach-linux/pw-mcp.sh scripts/install-linux.sh "$NAME/"
+          cp poc/reverse-attach-linux/README.md "$NAME/README.md"
+          tar czf "$NAME.tar.gz" "$NAME"
+          sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          echo "ASSET=$NAME.tar.gz" >> "$GITHUB_ENV"
+      - name: Upload to the release
+        # The macOS job creates the release; wait for it rather than racing on
+        # `gh release create` from two jobs.
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
+            sleep 30
+          done
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$ASSET" "$ASSET.sha256"

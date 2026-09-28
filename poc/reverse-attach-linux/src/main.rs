@@ -261,7 +261,6 @@ fn mint(
     Ok((secret, expires_in))
 }
 
-
 // ---------------------------------------------------------------------------
 // Tiny blocking HTTP/1.1 client for http:// only (used for the upstream MCP)
 // ---------------------------------------------------------------------------
@@ -272,7 +271,12 @@ struct HttpReply {
     body: String,
 }
 
-fn http_post(url: &str, headers: &[(&str, &str)], body: &str, timeout: Duration) -> Result<HttpReply, String> {
+fn http_post(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+    timeout: Duration,
+) -> Result<HttpReply, String> {
     let after_scheme = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("only http:// supported: {url}"))?;
@@ -281,7 +285,10 @@ fn http_post(url: &str, headers: &[(&str, &str)], body: &str, timeout: Duration)
         None => (after_scheme, "/"),
     };
     let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().map_err(|_| "bad port".to_string())?),
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|_| "bad port".to_string())?,
+        ),
         None => (authority.to_string(), 80u16),
     };
     let mut request = format!(
@@ -302,9 +309,13 @@ fn http_post(url: &str, headers: &[(&str, &str)], body: &str, timeout: Duration)
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10))
         .map_err(|e| format!("connect failed: {e}"))?;
     stream.set_read_timeout(Some(timeout)).ok();
-    stream.write_all(request.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("write failed: {e}"))?;
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|e| format!("read failed: {e}"))?;
+    stream
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("read failed: {e}"))?;
     let text = String::from_utf8_lossy(&raw).to_string();
     let (head, resp_body) = match text.find("\r\n\r\n") {
         Some(i) => (&text[..i], &text[i + 4..]),
@@ -320,21 +331,32 @@ fn http_post(url: &str, headers: &[(&str, &str)], body: &str, timeout: Duration)
     let mut chunked = false;
     for l in lines {
         if let Some((k, v)) = l.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("transfer-encoding") && v.to_lowercase().contains("chunked") {
+            if k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.to_lowercase().contains("chunked")
+            {
                 chunked = true;
             }
             hdrs.push((k.trim().to_lowercase(), v.trim().to_string()));
         }
     }
-    let body = if chunked { dechunk(resp_body) } else { resp_body.to_string() };
-    Ok(HttpReply { status, headers: hdrs, body })
+    let body = if chunked {
+        dechunk(resp_body)
+    } else {
+        resp_body.to_string()
+    };
+    Ok(HttpReply {
+        status,
+        headers: hdrs,
+        body,
+    })
 }
 
 fn dechunk(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     while let Some(nl) = rest.find("\r\n") {
-        let size = usize::from_str_radix(rest[..nl].trim().split(';').next().unwrap_or("0"), 16).unwrap_or(0);
+        let size = usize::from_str_radix(rest[..nl].trim().split(';').next().unwrap_or("0"), 16)
+            .unwrap_or(0);
         if size == 0 {
             break;
         }
@@ -402,7 +424,12 @@ impl Upstream {
         if let Some(s) = sid.as_deref() {
             headers.push(("Mcp-Session-Id", s));
         }
-        http_post(&self.url, &headers, &msg.to_string(), Duration::from_secs(90))
+        http_post(
+            &self.url,
+            &headers,
+            &msg.to_string(),
+            Duration::from_secs(90),
+        )
     }
 
     fn initialize(&self) -> Result<(), String> {
@@ -416,9 +443,16 @@ impl Upstream {
                        "clientInfo": {"name": "instance-mcp-rpi", "version": "0.4.0"}}
         }))?;
         if !(200..300).contains(&r.status) {
-            return Err(format!("upstream {} initialize HTTP {}", self.name, r.status));
+            return Err(format!(
+                "upstream {} initialize HTTP {}",
+                self.name, r.status
+            ));
         }
-        let sid = r.headers.iter().find(|(k, _)| k == "mcp-session-id").map(|(_, v)| v.clone());
+        let sid = r
+            .headers
+            .iter()
+            .find(|(k, _)| k == "mcp-session-id")
+            .map(|(_, v)| v.clone());
         if let Ok(mut g) = self.session_id.lock() {
             *g = sid;
         }
@@ -430,7 +464,13 @@ impl Upstream {
     }
 
     fn rpc(&self, method: &str, params: Option<Value>) -> Result<Value, String> {
-        if self.session_id.lock().ok().map(|g| g.is_none()).unwrap_or(true) {
+        if self
+            .session_id
+            .lock()
+            .ok()
+            .map(|g| g.is_none())
+            .unwrap_or(true)
+        {
             self.initialize()?;
         }
         let mut msg = json!({"jsonrpc": "2.0", "id": 1, "method": method});
@@ -444,7 +484,12 @@ impl Upstream {
             r = self.post(&msg)?;
         }
         if !(200..300).contains(&r.status) {
-            return Err(format!("upstream {} HTTP {}: {}", self.name, r.status, &r.body[..r.body.len().min(120)]));
+            return Err(format!(
+                "upstream {} HTTP {}: {}",
+                self.name,
+                r.status,
+                &r.body[..r.body.len().min(120)]
+            ));
         }
         let v = parse_mcp_body(&r.body)?;
         if let Some(e) = v.get("error") {
@@ -462,7 +507,11 @@ impl Upstream {
             }
         }
         let list = match self.rpc("tools/list", None) {
-            Ok(r) => r.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default(),
+            Ok(r) => r
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default(),
             Err(e) => {
                 eprintln!("upstream {}: {e}", self.name);
                 // Do not cache a failure: the next tools/list retries immediately.
@@ -483,10 +532,22 @@ impl Upstream {
 /// Everything else from the upstream (run_code_unsafe, upload, pdf, network, raw
 /// mouse-by-coordinate, dialogs, close, and any new tool) is denied under sandbox.
 const SANDBOX_BROWSER_TOOLS: &[&str] = &[
-    "browser_click", "browser_console_messages", "browser_evaluate", "browser_fill_form",
-    "browser_find", "browser_hover", "browser_navigate", "browser_navigate_back",
-    "browser_press_key", "browser_resize", "browser_select_option", "browser_snapshot",
-    "browser_tabs", "browser_take_screenshot", "browser_type", "browser_wait_for",
+    "browser_click",
+    "browser_console_messages",
+    "browser_evaluate",
+    "browser_fill_form",
+    "browser_find",
+    "browser_hover",
+    "browser_navigate",
+    "browser_navigate_back",
+    "browser_press_key",
+    "browser_resize",
+    "browser_select_option",
+    "browser_snapshot",
+    "browser_tabs",
+    "browser_take_screenshot",
+    "browser_type",
+    "browser_wait_for",
 ];
 
 fn upstream_tool_allowed(name: &str, profile: &str) -> bool {
@@ -504,7 +565,9 @@ fn upstream_tools_for(profile: &str, local_names: &[&str]) -> Vec<(Arc<Upstream>
     let mut out = Vec::new();
     for up in upstreams() {
         for t in up.tools() {
-            let Some(name) = t.get("name").and_then(|n| n.as_str()) else { continue };
+            let Some(name) = t.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
             if local_names.contains(&name) || !upstream_tool_allowed(name, profile) {
                 continue;
             }
@@ -519,7 +582,9 @@ fn upstream_owning(name: &str, profile: &str) -> Option<Arc<Upstream>> {
         return None;
     }
     upstreams().into_iter().find(|up| {
-        up.tools().iter().any(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
+        up.tools()
+            .iter()
+            .any(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
     })
 }
 
@@ -867,7 +932,10 @@ fn handle_tool_call(params: &Value, profile: &str) -> Result<Value, (i64, String
         "key" => tool_key(&arguments),
         other => match upstream_owning(other, profile) {
             Some(up) => up
-                .rpc("tools/call", Some(json!({"name": other, "arguments": arguments})))
+                .rpc(
+                    "tools/call",
+                    Some(json!({"name": other, "arguments": arguments})),
+                )
                 .map_err(|e| (-32000, e)),
             None => Err((-32601, format!("unknown tool: {other}"))),
         },
@@ -1586,7 +1654,9 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     // (the largest is a tools/call with a screenshot-sized argument, far smaller).
     const MAX_BODY: usize = 4 * 1024 * 1024;
     if content_length > MAX_BODY {
-        return Err(format!("request body too large: {content_length} > {MAX_BODY}"));
+        return Err(format!(
+            "request body too large: {content_length} > {MAX_BODY}"
+        ));
     }
 
     // Read remaining body bytes.

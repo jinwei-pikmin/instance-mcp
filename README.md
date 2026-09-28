@@ -60,6 +60,7 @@ you a shell; this exists for what SSH cannot reach.
 - `oab-instance-mcp` — this package. Swift, zero dependencies (Network.framework + ScreenCaptureKit).
 - Browser — `@playwright/mcp`, not ours. See [`poc/pw-mcp/README.md`](poc/pw-mcp/README.md).
 - Design notes: [`docs/requirements/connect-closed-loop.md`](docs/requirements/connect-closed-loop.md).
+- Linux hands node (Rust PoC, Raspberry Pi verified): [`docs/linux-setup.md`](docs/linux-setup.md).
 
 ## Tools
 
@@ -182,6 +183,9 @@ Tagged releases publish a universal, Developer-ID-signed and Apple-notarized ins
    without any of them. Future releases keep the same Developer ID + bundle id, so grants survive.
 5. The same wizard remains available from the menu bar as **Set Up Permissions…**; use the menu
    item to copy the MCP URL and bearer token into OpenAB Connect/Remote.
+
+Linux hands nodes (Raspberry Pi and other Debian boxes) get `oab-instance-mcp-VERSION-linux-{arm64,amd64}.tar.gz`
+from the same release; see [`docs/linux-setup.md`](docs/linux-setup.md).
 
 The `.app.zip` beside the package is an advanced/manual artifact. After unzipping:
 

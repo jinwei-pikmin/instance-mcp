@@ -1,5 +1,7 @@
 # reverse-attach (Linux hands node, Rust PoC)
 
+Step-by-step install on a fresh box: [`docs/linux-setup.md`](../../docs/linux-setup.md).
+
 Part of [#27](https://github.com/openabdev/instance-mcp/issues/27) (hands-node registry) and
 [#15](https://github.com/openabdev/instance-mcp/issues/15) (Linux-first Rust port). A single
 self-contained binary that makes a Linux box a lendable "hands" node for an openab-pty session,

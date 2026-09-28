@@ -73,3 +73,40 @@ jobs:
             gh --version && jq --version && rg --version &&
             test "$(id -u)" = "1000" && echo non-root-ok &&
             test -w /var/log/oab-jobs && echo jobs-dir-ok'
+
+  linux-hands-node:
+    name: Linux hands node (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: poc/reverse-attach-linux
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: poc/reverse-attach-linux
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+      - name: Build
+        run: cargo build --release
+      - name: Smoke (mock runtime, loopback)
+        # Exercises /attach, mint, disposition, MCP dispatch and bash; the
+        # screenshot/mouse/key tools are listed but not invoked (no seat here).
+        run: bash smoke.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reverse-attach-linux-${{ matrix.arch }}
+          path: poc/reverse-attach-linux/target/release/reverse-attach
