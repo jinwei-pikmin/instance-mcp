@@ -1,9 +1,13 @@
 # Linux hands node setup
 
 How to turn a Linux desktop box into an `oab-instance-mcp` hands node with the Rust PoC in
-[`poc/reverse-attach-linux/`](../poc/reverse-attach-linux/). Written from the deployment on
-`rpi1` (Raspberry Pi OS / Debian 13, aarch64, labwc) and verified end to end on 2026-09-28:
-lending to an openab-pty session, the OpenAB Connect Screens pane, and browser tools.
+[`poc/reverse-attach-linux/`](../poc/reverse-attach-linux/). Written from two deployments,
+both verified end to end on 2026-09-28 (lending to an openab-pty session, the OpenAB Connect
+Screens pane, browser tools):
+
+- `rpi1` — Raspberry Pi OS / Debian 13, aarch64, the stock labwc desktop (a display exists).
+- `black` — Ubuntu 24.04 Server, Intel N95, **no desktop at all**: a headless sway seat is created
+  by the installer (`--headless-seat`).
 
 Read the trust warning at the top of the [README](../README.md) first. On Linux it is stricter,
 not looser: `bash` is offered in **both** profiles, so anyone who can attach this node gets a
@@ -45,11 +49,15 @@ terminates TLS and stamps the caller's Tailscale identity. Same shape as the Mac
 
 ## Prerequisites
 
-- A desktop session on **seat0 running a wlroots compositor** (labwc, sway, wayfire). The
-  daemon shells out to `grim` (screenshot), `wlrctl` (pointer) and `wtype` (keyboard); all three
-  need the compositor's `wlr-screencopy`, `virtual-pointer` and `virtual-keyboard` protocols.
-  GNOME/Mutter and KDE do not expose these; see [Raspberry Pi notes](#raspberry-pi-notes) for
-  the no-monitor case.
+- A **wlroots compositor** as the seat (labwc, sway, wayfire): the daemon shells out to `grim`
+  (screenshot), `wlrctl` (pointer) and `wtype` (keyboard), which need the compositor's
+  `wlr-screencopy`, `virtual-pointer` and `virtual-keyboard` protocols. GNOME/Mutter and KDE do
+  not expose these. Two ways to have one:
+  - a desktop already running on seat0 (Raspberry Pi OS labwc, a sway login) — see
+    [Raspberry Pi notes](#raspberry-pi-notes) for the no-monitor case;
+  - **none** — pass `--headless-seat` to the installer and it runs `sway` with the headless
+    wlroots backend as user unit `oab-seat.service`: one 1920×1080 virtual output, no input
+    devices, no GPU or monitor needed (verified on `black`, Ubuntu 24.04 Server).
 - The node on the tailnet with **MagicDNS + HTTPS certificates** enabled (needed for
   `tailscale serve`). Do **not** do this on a k3s node that hosts openab-pty pods: host-level
   `tailscaled` gives every pod tailnet egress as the node (measured, see
@@ -57,10 +65,13 @@ terminates TLS and stamps the caller's Tailscale identity. Same shape as the Mac
 - Rust ≥ 1.85 (`rustup`), `sudo`.
 
 ```sh
-sudo apt-get install -y grim wlrctl wtype chromium nodejs npm
+sudo apt-get install -y grim wlrctl wtype nodejs npm        # + sway for --headless-seat
+sudo apt-get install -y chromium                             # Debian / Raspberry Pi OS only
 ```
 
-Debian 13 ships `nodejs` 20 and `npm` 9, which is enough for `@playwright/mcp`.
+Debian 13 ships `nodejs` 20 and `npm` 9, which is enough for `@playwright/mcp`. Ubuntu has no
+`chromium` deb (snap only, unusable from a user unit); the installer downloads Playwright's
+Chromium instead and handles the AppArmor rule it needs (see [Gotchas](#gotchas)).
 
 ## 1. Tailscale
 
@@ -91,6 +102,7 @@ curl -fsSLO "https://github.com/openabdev/instance-mcp/releases/download/v$V/oab
 sha256sum -c "oab-instance-mcp-$V-linux-$A.tar.gz.sha256"
 tar xzf "oab-instance-mcp-$V-linux-$A.tar.gz" && cd "oab-instance-mcp-$V-linux-$A"
 ./install-linux.sh            # does steps 3–5 below; --allow-login / --no-browser / --port
+./install-linux.sh --headless-seat   # same, on a box with no desktop (creates oab-seat.service)
 ```
 
 `install-linux.sh` is idempotent: it keeps an existing token, detects your Tailscale login,
@@ -278,6 +290,30 @@ WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u) wlr-randr    # outp
 Restarting the daemon drops every grant (registry is in memory); the runtime notices the socket
 close and the agent's `instance_status` says nothing is attached until you `POST /attach` again.
 
+## Headless server notes (Ubuntu 24.04 on `black`)
+
+What a box with no desktop needed beyond the Pi, all handled by `install-linux.sh --headless-seat`:
+
+- **Seat**: `sway` with `WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1 WLR_RENDERER=pixman`
+  as `oab-seat.service`; `~/.config/sway/config` declares `output HEADLESS-1 1920x1080`. sway
+  ignores `WAYLAND_DISPLAY` and takes the first free socket name — usually **`wayland-1`** — so
+  the installer reads the socket back from `/run/user/<uid>` and writes that into both units.
+- **Chromium**: Playwright's own build (`npx playwright install chromium`), since Ubuntu's is a
+  snap. Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor and Chromium's sandbox
+  aborts with `No usable sandbox!`; the installer writes `/etc/apparmor.d/playwright-chromium`
+  granting `userns` to that binary path (the distro-endorsed fix — the sandbox stays on; do not
+  reach for `--no-sandbox`). Playwright's Chromium also defaults to X11 and the headless seat has
+  no Xwayland ("launched a headed browser without having a XServer"), so `pw-config.json` adds
+  `--ozone-platform=wayland`.
+- **Fonts and locale**: a server has neither; the first page rendered as tofu boxes, the second
+  in Arabic (no `Accept-Language`, so example.com picked one). `fonts-dejavu-core`,
+  `fonts-liberation`, `fonts-noto-cjk`, `fonts-noto-color-emoji` plus `--lang=en-US` /
+  `locale: en-US` / `LANG=en_US.UTF-8`.
+- **Node from fnm/nvm**: `/usr/bin/node` was a symlink into `~/.local/share/fnm/...` with no
+  `npm` on the system PATH; `PW_NODE_BIN` in the unit carries that directory.
+- **Pod-host rule still applies**: `black` runs k3s (ARC controller, traefik) *and* host
+  `tailscaled`. That is fine only because it hosts no openab-pty pods; it must never start to.
+
 ## Raspberry Pi notes
 
 - **Raspberry Pi OS's stock desktop is already a headless seat.** With no monitor plugged in,
@@ -313,4 +349,9 @@ close and the agent's `instance_status` says nothing is attached until you `POST
 - **The daemon's `/attach` refuses loopback callers** without `Tailscale-User-Login` by design;
   use the `tailscale serve` URL even from the node itself.
 - **`pkill -f` inside `ssh host 'sh -c …'` kills the `sh -c`** whose command line matches.
-  Use `pkill -x <name>`.
+  Use `pkill -x <name>` — but `-x` matches at most 15 characters of the process name, so
+  `pkill -x oab-instance-mcp` silently matches nothing.
+- **Chromium `No usable sandbox!` / `Trace/breakpoint trap`** on Ubuntu 24.04+: AppArmor
+  userns restriction; see [Headless server notes](#headless-server-notes-ubuntu-2404-on-black).
+- **Headed browser "without having a XServer"** on a headless seat: Chromium picked X11; add
+  `--ozone-platform=wayland` (the installer's `pw-config.json` does).
