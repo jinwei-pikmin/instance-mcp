@@ -141,10 +141,12 @@ Notes on the grant model:
 - **Renewal** is a new `POST /attach` for the same session before expiry; macmini rotates the
   secret and keeps the socket. Nothing auto-renews.
 - **Mint path for the verifier (step 4)** — 4b implements **both**, exactly one per request:
-  `admin_credential` (macmini calls the pod's `POST /admin/sessions/{s}/tools-attach` with it,
-  uses it for that request only, keeps nothing; the runtime's TTL wins) or `secret` (the
-  client minted at the pod itself and hands macmini the result). Connect/Remote can pick
-  either; the grant record stores neither value.
+  `admin_credential` (macmini calls the pod's `POST /admin/sessions/{s}/tools-attach` with it
+  **and forwards the requested `ttl_secs` in the JSON body**, uses the credential for that
+  request only, keeps nothing; the runtime's returned expiry wins) or `secret` (the client
+  minted at the pod itself and hands macmini the result). Connect/Remote offer 1/2/4/12/24h;
+  instance-mcp and the default runtime ceiling allow 24h. A lower runtime ceiling rejects
+  with 400 rather than silently shortening the lease. The grant record stores neither secret.
 
 Alternative rendezvous (both sides dial `openab-cp`) is viable and aligns with the openab-pty
 → CP-runtime direction, but adds a third component; not needed for the first cut.
