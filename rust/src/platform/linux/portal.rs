@@ -25,7 +25,9 @@ use zbus::zvariant::{DynamicType, OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, Proxy};
 
 use crate::log;
-use crate::platform::desktop::{Button, Capture, Desktop, DesktopFuture, Display, Key, NamedKey};
+use crate::platform::desktop::{
+    Button, Capture, Desktop, DesktopFacts, DesktopFuture, Display, Key, NamedKey,
+};
 
 const DEST: &str = "org.freedesktop.portal.Desktop";
 const PATH: &str = "/org/freedesktop/portal/desktop";
@@ -70,6 +72,9 @@ struct Inner {
     last_used: StdMutex<Instant>,
     token_path: PathBuf,
     reaper: std::sync::Once,
+    /// Layout from the most recent session; kept after it closes so `sys_info` can report
+    /// displays without opening (or waiting on) a session.
+    last_layout: StdMutex<Vec<Display>>,
 }
 
 pub struct Portal(Arc<Inner>);
@@ -82,13 +87,21 @@ fn new_token() -> String {
 
 impl Portal {
     pub fn new(config_dir: PathBuf) -> Self {
-        Portal(Arc::new(Inner {
+        let inner = Arc::new(Inner {
             conn: OnceCell::new(),
             session: Mutex::new(None),
             last_used: StdMutex::new(Instant::now()),
             token_path: config_dir.join("portal-restore-token"),
             reaper: std::sync::Once::new(),
-        }))
+            last_layout: StdMutex::new(Vec::new()),
+        });
+        // Learn the layout up front so `sys_info` lists displays before any session: a
+        // client like OpenAB Connect only takes screenshots of a machine that has displays.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let me = inner.clone();
+            rt.spawn(async move { me.refresh_layout().await });
+        }
+        Portal(inner)
     }
 }
 
@@ -301,75 +314,125 @@ impl Inner {
         Ok(session)
     }
 
-    /// On GNOME, look up each monitor's scale from Mutter and match it to the stream at the
-    /// same logical position. Any failure leaves 1.0, which is right for non-GNOME desktops.
-    async fn apply_motion_scales(&self, streams: &mut [Stream]) {
+    /// GNOME's logical monitors straight from Mutter: no consent, no session. None when
+    /// not on GNOME.
+    async fn mutter_layout(&self) -> Option<Result<Vec<Display>, String>> {
         let gnome = std::env::var("XDG_CURRENT_DESKTOP")
             .is_ok_and(|d| d.to_ascii_uppercase().contains("GNOME"));
         if !gnome {
-            return;
+            return None;
         }
-        let scales = async {
-            let conn = self.conn().await?;
-            let p = Proxy::new(
-                conn,
-                "org.gnome.Mutter.DisplayConfig",
-                "/org/gnome/Mutter/DisplayConfig",
-                "org.gnome.Mutter.DisplayConfig",
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            let reply = p
-                .call_method("GetCurrentState", &())
+        Some(
+            async {
+                let conn = self.conn().await?;
+                let p = Proxy::new(
+                    conn,
+                    "org.gnome.Mutter.DisplayConfig",
+                    "/org/gnome/Mutter/DisplayConfig",
+                    "org.gnome.Mutter.DisplayConfig",
+                )
                 .await
                 .map_err(|e| e.to_string())?;
-            let body = reply.body();
-            // (serial, monitors, logical_monitors, properties); only logical_monitors matter:
-            // a(iiduba(ssss)a{sv}) = x, y, scale, transform, primary, monitors, props.
-            type Mode = (
-                String,
-                i32,
-                i32,
-                f64,
-                f64,
-                Vec<f64>,
-                HashMap<String, OwnedValue>,
-            );
-            type Monitor = (
-                (String, String, String, String),
-                Vec<Mode>,
-                HashMap<String, OwnedValue>,
-            );
-            type Logical = (
-                i32,
-                i32,
-                f64,
-                u32,
-                bool,
-                Vec<(String, String, String, String)>,
-                HashMap<String, OwnedValue>,
-            );
-            let (_, _, logical, _): (u32, Vec<Monitor>, Vec<Logical>, HashMap<String, OwnedValue>) =
-                body.deserialize().map_err(|e| e.to_string())?;
-            Ok::<_, String>(
-                logical
+                let reply = p
+                    .call_method("GetCurrentState", &())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                // (serial, monitors, logical_monitors, properties)
+                // monitor: ((connector, vendor, product, serial), modes, props)
+                // mode: (id, width, height, refresh, preferred_scale, supported_scales, props{is-current})
+                // logical: (x, y, scale, transform, primary, [(connector, …)], props)
+                type Mode = (
+                    String,
+                    i32,
+                    i32,
+                    f64,
+                    f64,
+                    Vec<f64>,
+                    HashMap<String, OwnedValue>,
+                );
+                type Monitor = (
+                    (String, String, String, String),
+                    Vec<Mode>,
+                    HashMap<String, OwnedValue>,
+                );
+                type Logical = (
+                    i32,
+                    i32,
+                    f64,
+                    u32,
+                    bool,
+                    Vec<(String, String, String, String)>,
+                    HashMap<String, OwnedValue>,
+                );
+                let (_, monitors, logical, _): (
+                    u32,
+                    Vec<Monitor>,
+                    Vec<Logical>,
+                    HashMap<String, OwnedValue>,
+                ) = reply.body().deserialize().map_err(|e| e.to_string())?;
+                let current = |connector: &str| -> Option<(f64, f64)> {
+                    let m = monitors.iter().find(|m| m.0 .0 == connector)?;
+                    let mode = m.1.iter().find(|md| {
+                        md.6.get("is-current")
+                            .and_then(|v| bool::try_from(&**v).ok())
+                            .unwrap_or(false)
+                    })?;
+                    Some((mode.1 as f64, mode.2 as f64))
+                };
+                let mut out: Vec<(bool, Display)> = logical
+                    .iter()
+                    .filter_map(|l| {
+                        let (pw, ph) = current(&l.5.first()?.0)?;
+                        // Transforms 1, 3 (and their flipped 5, 7) rotate by 90°.
+                        let (pw, ph) = if l.3 % 2 == 1 { (ph, pw) } else { (pw, ph) };
+                        let scale = if l.2 > 0.0 { l.2 } else { 1.0 };
+                        let d = Display {
+                            index: 0,
+                            x: l.0 as f64,
+                            y: l.1 as f64,
+                            width: (pw / scale).round(),
+                            height: (ph / scale).round(),
+                            scale,
+                        };
+                        Some((l.4, d))
+                    })
+                    .collect();
+                out.sort_by(|a, b| {
+                    let key = |d: &Display| (!(d.x == 0.0 && d.y == 0.0), d.y, d.x);
+                    key(&a.1).partial_cmp(&key(&b.1)).unwrap()
+                });
+                Ok(out
                     .into_iter()
-                    .map(|l| (l.0 as f64, l.1 as f64, l.2))
-                    .collect::<Vec<_>>(),
-            )
+                    .enumerate()
+                    .map(|(i, (_, d))| Display { index: i, ..d })
+                    .collect())
+            }
+            .await,
+        )
+    }
+
+    /// Refresh the cached layout that `sys_info` reports, without opening a session.
+    async fn refresh_layout(&self) {
+        if let Some(Ok(layout)) = self.mutter_layout().await {
+            if !layout.is_empty() {
+                *self.last_layout.lock().unwrap() = layout;
+            }
         }
-        .await;
-        match scales {
-            Ok(scales) => {
+    }
+
+    /// On GNOME, give each stream its monitor's scale (matched by logical position); any
+    /// failure leaves 1.0, which is right for non-GNOME desktops.
+    async fn apply_motion_scales(&self, streams: &mut [Stream]) {
+        match self.mutter_layout().await {
+            None => {}
+            Some(Ok(layout)) => {
                 for st in streams.iter_mut() {
-                    if let Some(&(_, _, scale)) =
-                        scales.iter().find(|(x, y, _)| *x == st.x && *y == st.y)
-                    {
-                        st.motion_scale = scale;
+                    if let Some(d) = layout.iter().find(|d| d.x == st.x && d.y == st.y) {
+                        st.motion_scale = d.scale;
                     }
                 }
             }
-            Err(e) => log(&format!(
+            Some(Err(e)) => log(&format!(
                 "desktop: could not read GNOME monitor scales ({e}); assuming 1.0"
             )),
         }
@@ -402,6 +465,7 @@ impl Inner {
         }
         let s = self.open_session().await?;
         *guard = Some(s.clone());
+        *self.last_layout.lock().unwrap() = displays_of(&s);
         let me = self.clone();
         self.reaper.call_once(move || {
             tokio::spawn(async move {
@@ -505,6 +569,7 @@ fn displays_of(s: &Session) -> Vec<Display> {
             y: st.y,
             width: st.w,
             height: st.h,
+            scale: st.motion_scale,
         })
         .collect()
 }
@@ -746,6 +811,14 @@ impl Desktop for Portal {
             tokio::time::sleep(UNICODE_ENTRY_PAUSE).await;
             Ok(())
         })
+    }
+
+    fn facts(&self) -> DesktopFacts {
+        let displays = self.0.last_layout.lock().unwrap().clone();
+        DesktopFacts {
+            consent: self.0.load_token().is_some(),
+            displays,
+        }
     }
 
     fn status(&self) -> String {

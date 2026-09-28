@@ -21,6 +21,13 @@ use tools::sysinfo::SysInfoTool;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 static QUIET: OnceLock<bool> = OnceLock::new();
+static LOG_REQUESTS: OnceLock<bool> = OnceLock::new();
+
+/// `--log-requests`: one line per HTTP request (method, path, client, user agent) — for
+/// seeing what a client such as OpenAB Connect actually asks for.
+pub fn log_requests() -> bool {
+    LOG_REQUESTS.get().copied().unwrap_or(false)
+}
 
 pub fn log(msg: &str) {
     if !QUIET.get().copied().unwrap_or(false) {
@@ -38,6 +45,7 @@ struct Options {
     token_file: Option<String>,
     insecure_local: bool,
     quiet: bool,
+    log_requests: bool,
     attach: bool,
     desktop: bool,
 }
@@ -48,7 +56,7 @@ fn usage() -> ! {
 
 USAGE: oab-instance-mcp [--host 127.0.0.1] [--port 8795] [--path /mcp]
                         [--allow-login <email>]... [--token <str> | --token-file <path>]
-                        [--insecure-local] [--quiet] [--no-attach] [--no-desktop]
+                        [--insecure-local] [--quiet] [--log-requests] [--no-attach] [--no-desktop]
 
 Auth (at least one required unless --insecure-local):
   --allow-login   Tailscale login (from `tailscale serve`'s Tailscale-User-Login header). Repeatable.
@@ -83,6 +91,7 @@ fn parse_args() -> Options {
         token_file: None,
         insecure_local: false,
         quiet: false,
+        log_requests: false,
         attach: true,
         desktop: true,
     };
@@ -108,6 +117,7 @@ fn parse_args() -> Options {
             "--token-file" => o.token_file = Some(next(&a, &mut args)),
             "--insecure-local" => o.insecure_local = true,
             "--quiet" => o.quiet = true,
+            "--log-requests" => o.log_requests = true,
             "--no-attach" => o.attach = false,
             "--no-desktop" => o.desktop = false,
             "--upstream" | "--menu-bar" | "--public-url" => {
@@ -175,6 +185,7 @@ async fn main() {
     // One TLS crypto provider for every rustls user (wss:// dial, https:// mint).
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
     let _ = QUIET.set(opts.quiet);
+    let _ = LOG_REQUESTS.set(opts.log_requests);
 
     let auth = AuthPolicy::new(
         opts.allow_logins.clone(),

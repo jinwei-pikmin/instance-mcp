@@ -87,6 +87,23 @@ impl RpcRequest {
     }
 }
 
+/// Whole-valued floats as integers (`1800.0` → `1800`), as the Swift build's encoder
+/// writes them. Mac-first clients decode fields such as display sizes into `Int`, and
+/// Foundation's JSONDecoder may refuse `1800.0` for an `Int`.
+pub fn swift_numbers(v: Value) -> Value {
+    match v {
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() < 1e15 => Value::from(f as i64),
+            _ => Value::Number(n),
+        },
+        Value::Array(a) => Value::Array(a.into_iter().map(swift_numbers).collect()),
+        Value::Object(o) => {
+            Value::Object(o.into_iter().map(|(k, v)| (k, swift_numbers(v))).collect())
+        }
+        other => other,
+    }
+}
+
 pub fn rpc_result(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -289,7 +306,7 @@ impl McpServer {
     pub async fn handle(&self, req: &RpcRequest) -> Option<Value> {
         let id = req.id.clone()?;
         Some(match self.dispatch(req).await {
-            Ok(result) => rpc_result(id, result),
+            Ok(result) => rpc_result(id, swift_numbers(result)),
             Err(e) => rpc_error(id, &e),
         })
     }
@@ -464,6 +481,12 @@ mod tests {
         assert_eq!(r["error"]["message"], "Invalid params: unknown tool: exec");
         assert!(ToolProfile::Sandbox.allows("browser_click"));
         assert!(!ToolProfile::Sandbox.allows("browser_run_code_unsafe"));
+    }
+
+    #[test]
+    fn whole_floats_encode_as_integers() {
+        let v = swift_numbers(json!({"w": 1728.0, "s": 1.6666, "n": [0.0, -3.0], "i": 7}));
+        assert_eq!(v.to_string(), r#"{"i":7,"n":[0,-3],"s":1.6666,"w":1728}"#);
     }
 
     #[test]

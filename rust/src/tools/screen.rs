@@ -578,6 +578,7 @@ mod tests {
                             y: 0.0,
                             width: 100.0,
                             height: 50.0,
+                            scale: 2.0,
                         },
                         Display {
                             index: 1,
@@ -585,6 +586,7 @@ mod tests {
                             y: 0.0,
                             width: 50.0,
                             height: 50.0,
+                            scale: 2.0,
                         },
                     ],
                 })
@@ -617,6 +619,9 @@ mod tests {
         }
         fn status(&self) -> String {
             String::new()
+        }
+        fn facts(&self) -> crate::platform::desktop::DesktopFacts {
+            Default::default()
         }
     }
 

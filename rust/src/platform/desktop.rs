@@ -23,6 +23,8 @@ pub struct Display {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    /// Physical pixels per point on this display (1.0, 2.0, 1.667 …).
+    pub scale: f64,
 }
 
 /// A full-desktop capture plus how its pixels map to points.
@@ -31,6 +33,14 @@ pub struct Capture {
     pub image: RgbaImage,
     /// Physical pixels per point (e.g. 1.6667 for 5/3 fractional scaling).
     pub pixels_per_point: f64,
+    pub displays: Vec<Display>,
+}
+
+/// What `sys_info` can say about the desktop without prompting anyone.
+#[derive(Debug, Clone, Default)]
+pub struct DesktopFacts {
+    pub consent: bool,
+    /// Empty until a session has been opened once.
     pub displays: Vec<Display>,
 }
 
@@ -106,4 +116,8 @@ pub trait Desktop: Send + Sync {
 
     /// One-line status for `sys_info` without triggering a consent prompt.
     fn status(&self) -> String;
+
+    /// Whether the human has already approved remote control (so screen and input work
+    /// without a prompt), and the displays if they are known without asking. Never prompts.
+    fn facts(&self) -> DesktopFacts;
 }

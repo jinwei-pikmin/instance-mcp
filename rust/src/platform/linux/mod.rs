@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::{json, Value};
 
-use super::desktop::Desktop;
+use super::desktop::{Desktop, DesktopFacts};
 use super::PlatformBackend;
 
 pub struct Linux;
@@ -31,7 +31,7 @@ impl PlatformBackend for Linux {
     }
 
     fn describe(&self, agent_version: &str, tool_names: &[&str]) -> (Value, Vec<String>) {
-        let desktop = self.desktop().map(|d| d.status());
+        let desktop = self.desktop().map(|d| (d.status(), d.facts()));
         describe(&self.hostname(), agent_version, tool_names, desktop)
     }
 
@@ -186,7 +186,7 @@ fn describe(
     host: &str,
     agent_version: &str,
     tool_names: &[&str],
-    desktop: Option<String>,
+    desktop: Option<(String, DesktopFacts)>,
 ) -> (Value, Vec<String>) {
     let os = os_pretty();
     let hw = hardware();
@@ -201,6 +201,32 @@ fn describe(
         "osascript": false,
     });
 
+    // Same keys and types as the Swift build's sys_info, so clients written against the Mac
+    // (OpenAB Connect decodes this) accept a Linux instance. Linux has no TCC: screen and
+    // input "permissions" mean the desktop's remote-control consent has been given.
+    let facts = desktop.as_ref().map(|(_, f)| f.clone()).unwrap_or_default();
+    let consent = desktop.is_some() && facts.consent;
+    let displays: Vec<Value> = facts
+        .displays
+        .iter()
+        .map(|d| {
+            json!({
+                "id": d.index,
+                "main": d.index == 0,
+                "origin": {"x": d.x, "y": d.y},
+                "points": {"width": d.width, "height": d.height},
+                "pixels": {"width": (d.width * d.scale).round(), "height": (d.height * d.scale).round()},
+            })
+        })
+        .collect();
+    let permissions = json!({
+        "screen_recording": consent,
+        "accessibility": consent,
+        "full_disk_access": true,
+        "full_disk_access_state": "granted",
+    });
+    let desktop_status = desktop.as_ref().map(|(s, _)| s.clone());
+
     let structured = json!({
         "agent": {"name": "oab-instance-mcp", "version": agent_version, "pid": std::process::id(), "platform": "linux"},
         "host": host,
@@ -208,8 +234,11 @@ fn describe(
         "hardware": hw,
         "user": user,
         "session": sess,
+        "console_user": if gui { user.clone() } else { "none".to_string() },
         "gui_session": gui,
-        "desktop": desktop,
+        "displays": displays,
+        "permissions": permissions,
+        "desktop": desktop_status,
         "tailscale_ips": tail,
         "capabilities": capabilities,
         "uptime_secs": uptime_secs(),
@@ -242,7 +271,7 @@ fn describe(
         ),
         format!("tools: {}", tool_names.join(", ")),
     ];
-    match &desktop {
+    match &desktop_status {
         Some(d) => lines.push(format!("desktop: {d}")),
         None => lines.push(
             "→ no graphical session in the agent's environment: screenshot / mouse / key are off; use exec"

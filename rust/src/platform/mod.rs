@@ -106,6 +106,30 @@ mod tests {
         assert_eq!(facts["host"], b.hostname());
         assert_eq!(facts["capabilities"]["exec"], true);
         assert_eq!(facts["capabilities"]["screenshot"], false);
+        // Swift-compatible keys that Mac-first clients decode.
+        for k in [
+            "agent",
+            "host",
+            "os",
+            "hardware",
+            "user",
+            "console_user",
+            "gui_session",
+            "displays",
+            "tailscale_ips",
+            "permissions",
+            "uptime_secs",
+        ] {
+            assert!(!facts[k].is_null(), "sys_info lacks {k}");
+        }
+        for k in [
+            "screen_recording",
+            "accessibility",
+            "full_disk_access",
+            "full_disk_access_state",
+        ] {
+            assert!(!facts["permissions"][k].is_null(), "permissions lacks {k}");
+        }
         assert!(lines.last().unwrap().ends_with("test"));
     }
 }

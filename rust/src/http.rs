@@ -92,7 +92,7 @@ fn json(status: StatusCode, v: &Value) -> Response {
     (
         status,
         [("content-type", "application/json")],
-        v.to_string(),
+        crate::mcp::swift_numbers(v.clone()).to_string(),
     )
         .into_response()
 }
@@ -106,6 +106,15 @@ async fn handle(
     body: Bytes,
 ) -> Response {
     let path = uri.path();
+    if crate::log_requests() {
+        let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("-");
+        log(&format!(
+            "req {method} {uri} from {} ua={:?} login={}",
+            h("x-forwarded-for"),
+            h("user-agent"),
+            h("tailscale-user-login")
+        ));
+    }
     if path == "/healthz" {
         return text(StatusCode::OK, "ok\n");
     }
