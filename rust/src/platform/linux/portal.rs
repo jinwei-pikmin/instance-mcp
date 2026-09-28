@@ -218,7 +218,18 @@ impl Inner {
             })
             .ok_or("CreateSession returned no session_handle")?;
         let session = OwnedObjectPath::try_from(path).map_err(|e| e.to_string())?;
+        let started = self.start_session(session.clone()).await;
+        if started.is_err() {
+            // Otherwise a timed-out consent dialog stays on screen and every retry adds
+            // another orphaned portal session.
+            self.close_path(&session).await;
+        }
+        started
+    }
 
+    /// SelectDevices, SelectSources, Start on a created session. The caller closes the
+    /// session if this fails.
+    async fn start_session(&self, session: OwnedObjectPath) -> Result<Session, String> {
         let mut o = Opts::new();
         o.insert("types", Value::from(3u32)); // keyboard | pointer
         o.insert("persist_mode", Value::from(2u32)); // until explicitly revoked
@@ -286,7 +297,6 @@ impl Inner {
             streams,
         };
         if devices & 3 != 3 {
-            self.close(&session).await;
             self.save_token(None);
             return Err(
                 "remote control was not allowed in the desktop's dialog; call again and, on this \
@@ -295,7 +305,6 @@ impl Inner {
             );
         }
         if session.streams.is_empty() {
-            self.close(&session).await;
             return Err("the desktop shared no monitors".into());
         }
         log(&format!(
@@ -439,14 +448,13 @@ impl Inner {
     }
 
     async fn close(&self, s: &Session) {
+        self.close_path(&s.path).await;
+    }
+
+    async fn close_path(&self, path: &OwnedObjectPath) {
         if let Ok(conn) = self.conn().await {
-            if let Ok(p) = Proxy::new(
-                conn,
-                DEST,
-                s.path.as_ref(),
-                "org.freedesktop.portal.Session",
-            )
-            .await
+            if let Ok(p) =
+                Proxy::new(conn, DEST, path.as_ref(), "org.freedesktop.portal.Session").await
             {
                 let _ = p.call_method("Close", &()).await;
             }
@@ -502,8 +510,10 @@ impl Inner {
             let r = self.proxy(RD).await?.call_method(method, &build(&s)).await;
             match r {
                 Ok(_) => return Ok(()),
-                // Bad arguments are ours to report, not a dead session to reopen.
-                Err(e) if attempt == 0 && !e.to_string().contains("Invalid") => {
+                // A dead session (closed by the desktop, or stopped from its indicator:
+                // "AccessDenied: Invalid session") is reopened once; bad arguments are ours
+                // to report and would fail the same way again.
+                Err(e) if attempt == 0 && !is_bad_argument(&e) => {
                     log(&format!(
                         "desktop: {method} failed ({e}); reopening the session"
                     ));
@@ -572,6 +582,12 @@ fn displays_of(s: &Session) -> Vec<Display> {
             scale: st.motion_scale,
         })
         .collect()
+}
+
+/// Errors caused by our arguments rather than by the session: reopening cannot fix them.
+fn is_bad_argument(e: &zbus::Error) -> bool {
+    let text = e.to_string();
+    text.contains("Invalid position") || text.contains("InvalidArgs")
 }
 
 /// Reach logical point (x, y) on a stream of logical size w×h whose absolute motion is
@@ -858,6 +874,38 @@ mod tests {
             PathBuf::from("/tmp/a b.png")
         );
         assert!(file_uri_to_path("https://x/y.png").is_none());
+    }
+
+    #[test]
+    fn only_argument_errors_skip_the_reopen() {
+        use zbus::names::ErrorName;
+        let err = |name: &'static str, msg: &str| {
+            zbus::Error::MethodError(
+                ErrorName::from_static_str(name).unwrap().into(),
+                Some(msg.into()),
+                zbus::message::Message::method_call("/", "x")
+                    .unwrap()
+                    .build(&())
+                    .unwrap(),
+            )
+        };
+        assert!(is_bad_argument(&err(
+            "org.freedesktop.DBus.Error.Failed",
+            "Invalid position"
+        )));
+        assert!(is_bad_argument(&err(
+            "org.freedesktop.DBus.Error.InvalidArgs",
+            "bad"
+        )));
+        // A revoked or closed session must be reopened, even though its text says "Invalid".
+        assert!(!is_bad_argument(&err(
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "Invalid session"
+        )));
+        assert!(!is_bad_argument(&err(
+            "org.freedesktop.DBus.Error.Failed",
+            "Session is not allowed to call NotifyPointer methods"
+        )));
     }
 
     #[test]

@@ -113,9 +113,10 @@ pub fn exit_code(st: ExitStatus) -> (i32, bool) {
     }
 }
 
-/// How long to keep reading after the command itself has exited. Pipes normally hit EOF
-/// at once; if they do not, a background process it started (`firefox &`, `nohup … &`)
-/// inherited them and may hold them for hours, so we stop waiting.
+/// How long to wait for output after the command itself has exited. Pipes normally hit
+/// EOF at once; if they do not, a background process it started (`firefox &`, `nohup … &`)
+/// inherited them and may hold them for hours, so we answer without waiting — while the
+/// readers keep draining in the background so that process can still write.
 pub const PIPE_GRACE: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
@@ -144,15 +145,13 @@ async fn read_capped(mut r: impl AsyncRead + Unpin, cap: usize, into: Arc<Mutex<
     }
 }
 
-/// Wait up to `grace` for every task; abort the stragglers. True if all finished.
+/// Wait up to `grace` for every task. True if all finished. Stragglers are *not*
+/// aborted: they keep draining the pipe until the background process that holds it exits.
+/// Aborting would close the read end, and that process would die of SIGPIPE on its next
+/// write (`nohup server &` logging its first line).
 pub async fn join_within(tasks: Vec<tokio::task::JoinHandle<()>>, grace: Duration) -> bool {
-    let aborts: Vec<_> = tasks.iter().map(|t| t.abort_handle()).collect();
     let all = futures_util::future::join_all(tasks);
-    if tokio::time::timeout(grace, all).await.is_ok() {
-        return true;
-    }
-    aborts.iter().for_each(|a| a.abort());
-    false
+    tokio::time::timeout(grace, all).await.is_ok()
 }
 
 pub struct Outcome {
@@ -360,6 +359,28 @@ mod tests {
                 .unwrap()
                 .output_detached
         );
+    }
+
+    #[tokio::test]
+    async fn a_background_process_can_keep_writing_after_exec_returns() {
+        // Returning early must not close the pipe under it (SIGPIPE on its next write).
+        let dir = tempfile::tempdir().unwrap();
+        let mark = dir.path().join("wrote");
+        let cmd = format!(
+            "(sleep 0.6; echo late; echo later; touch {}) &",
+            mark.display()
+        );
+        let r = run(&cmd, "/", &env(), Duration::from_secs(10), 1024)
+            .await
+            .unwrap();
+        assert!(r.output_detached);
+        for _ in 0..40 {
+            if mark.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the background process died when it wrote after exec returned");
     }
 
     #[test]

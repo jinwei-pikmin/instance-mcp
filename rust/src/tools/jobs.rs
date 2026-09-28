@@ -260,8 +260,9 @@ impl JobRegistry {
                     }
                 }
             };
-            // Stop teeing shortly after exit even if a background process it started still
-            // holds the pipes, so the job does not stay "running" for that process's life.
+            // Report the job finished shortly after the command exits even if a background
+            // process it started still holds the pipes. The tee keeps copying that process's
+            // output into the log (cutting it would kill it with SIGPIPE).
             join_within(vec![tee_out, tee_err], PIPE_GRACE).await;
             let (code, signalled) = status.map(exit_code).unwrap_or((-1, false));
             let state = if timed_out || signalled {
@@ -389,7 +390,8 @@ impl Tool for ExecPollTool {
             "Fetch a background job's state and any output produced since your last poll. Pass the \
              `job_id` from exec_start and, to get only new output, the `stdout_since`/`stderr_since` \
              byte offsets returned by the previous poll. When `state` is `exited` or `killed`, \
-             `exit_code` is set and no more output will appear. Each poll returns at most \
+             `exit_code` is set; output from the command itself is complete (a background process \
+             it started may still append to the log). Each poll returns at most \
              `max_bytes` per stream (default 256 KiB, max 1 MiB); when `stdout_more`/`stderr_more` \
              is true, poll again from `stdout_next`/`stderr_next`. Output is read from the job's log \
              files (never truncated); terminal-job metadata is retained ~10 min, and the log files \
@@ -663,6 +665,29 @@ mod tests {
             .call(&json!({"command": "true", "timeout_secs": 1e20, "cwd": "/"}))
             .await;
         assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_background_child_of_a_job_survives_and_its_output_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = JobRegistry::new(dir.path().into());
+        let job = reg
+            .start(
+                "(sleep 0.6; echo late) &",
+                "/",
+                &build_env(&json!({})),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let j = wait_done(&reg, &job.id).await;
+        assert_eq!(j.state(), JobState::Exited);
+        for _ in 0..40 {
+            if read_log(&j.out_path, 0, 64, true).bytes == b"late\n" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("background output was cut off (its writer died of SIGPIPE?)");
     }
 
     #[tokio::test]
