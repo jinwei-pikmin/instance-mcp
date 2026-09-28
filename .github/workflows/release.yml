@@ -186,6 +186,9 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # Same approval gate as the macOS job. Without it these jobs start on tag push, wait for
+    # a release that only exists once a human approves the macOS job, and time out (v0.6.5).
+    environment: release
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
@@ -222,6 +225,10 @@ jobs:
             gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && break
             sleep 30
           done
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null || {
+            echo "release $RELEASE_TAG does not exist after 30 min; did the macOS job fail or get rejected?" >&2
+            echo "Retry with: gh workflow run release.yml -f tag=$RELEASE_TAG" >&2
+            exit 1
+          }
           gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             "$ASSET" "$ASSET.sha256"
