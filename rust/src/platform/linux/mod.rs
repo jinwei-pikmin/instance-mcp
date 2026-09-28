@@ -31,7 +31,13 @@ impl PlatformBackend for Linux {
     }
 
     fn describe(&self, agent_version: &str, tool_names: &[&str]) -> (Value, Vec<String>) {
-        let desktop = self.desktop().map(|d| (d.status(), d.facts()));
+        // Only when this server actually offers the desktop tools: with --no-desktop (or
+        // in a server without them) sys_info must not advertise displays or permissions.
+        let desktop = tool_names
+            .contains(&"screenshot")
+            .then(|| self.desktop())
+            .flatten()
+            .map(|d| (d.status(), d.facts()));
         describe(&self.hostname(), agent_version, tool_names, desktop)
     }
 
@@ -271,14 +277,18 @@ fn describe(
         ),
         format!("tools: {}", tool_names.join(", ")),
     ];
+    // Hints name only tools this server offers: a sandbox-scoped caller has no exec.
+    let has_exec = tool_names.contains(&"exec");
     match &desktop_status {
         Some(d) => lines.push(format!("desktop: {d}")),
-        None => lines.push(
-            "→ no graphical session in the agent's environment: screenshot / mouse / key are off; use exec"
-                .into(),
-        ),
+        None => lines.push(format!(
+            "→ screenshot / mouse / key are not offered here{}",
+            if has_exec { "; use exec" } else { "" }
+        )),
     }
-    lines.push("→ osascript does not exist on Linux; use exec (e.g. gdbus, xdg-open)".into());
+    if has_exec {
+        lines.push("→ osascript does not exist on Linux; use exec (e.g. gdbus, xdg-open)".into());
+    }
     lines.push(format!("agent {agent_version}"));
     (structured, lines)
 }

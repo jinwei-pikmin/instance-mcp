@@ -1,7 +1,7 @@
 //! Cheap orientation call for a model that just connected: what machine is this, what can
 //! I do here. No side effects. Port of `SysInfoTool.swift`; facts come from the backend.
 
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -10,8 +10,9 @@ use crate::platform;
 
 pub struct SysInfoTool {
     pub agent_version: &'static str,
-    /// Filled in once the server's tool list is known, so the report matches reality.
-    pub tool_names: OnceLock<Vec<&'static str>>,
+    /// The tools of the server this instance is served from — bound by `McpServer::new`,
+    /// so a sandbox-scoped server reports its own, narrower list.
+    pub tool_names: Vec<&'static str>,
 }
 
 impl Tool for SysInfoTool {
@@ -29,10 +30,16 @@ impl Tool for SysInfoTool {
     fn input_schema(&self) -> Value {
         json!({"type": "object", "properties": {}})
     }
+    fn bind_tool_names(&self, tool_names: &[&'static str]) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(SysInfoTool {
+            agent_version: self.agent_version,
+            tool_names: tool_names.to_vec(),
+        }))
+    }
     fn call<'a>(&'a self, _args: &'a Value) -> ToolFuture<'a> {
         Box::pin(async move {
-            let names = self.tool_names.get().cloned().unwrap_or_default();
-            let (structured, lines) = platform::backend().describe(self.agent_version, &names);
+            let (structured, lines) =
+                platform::backend().describe(self.agent_version, &self.tool_names);
             Ok(ToolResult::text(lines.join("\n"), Some(structured)))
         })
     }

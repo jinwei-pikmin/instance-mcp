@@ -194,6 +194,13 @@ pub trait Tool: Send + Sync {
     fn descriptor(&self) -> Value {
         json!({"name": self.name(), "description": self.description(), "inputSchema": self.input_schema()})
     }
+
+    /// For tools whose answer depends on the server they are served from (`sys_info`
+    /// reports the tool list): a copy bound to `tool_names`, the list of the server being
+    /// built. Called by `McpServer::new`, so a `scoped` server rebinds too.
+    fn bind_tool_names(&self, _tool_names: &[&'static str]) -> Option<Arc<dyn Tool>> {
+        None
+    }
 }
 
 /// Which tools a connection may see and call. `owner` is the logged-in human's own CLI:
@@ -273,6 +280,11 @@ impl McpServer {
         instructions: Option<String>,
         tools: Vec<Arc<dyn Tool>>,
     ) -> Self {
+        let names: Vec<&'static str> = tools.iter().map(|t| t.name()).collect();
+        let tools: Vec<Arc<dyn Tool>> = tools
+            .into_iter()
+            .map(|t| t.bind_tool_names(&names).unwrap_or(t))
+            .collect();
         let by_name = tools.iter().map(|t| (t.name(), t.clone())).collect();
         Self {
             name: name.into(),

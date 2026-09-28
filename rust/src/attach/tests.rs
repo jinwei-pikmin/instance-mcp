@@ -64,6 +64,34 @@ fn full_server() -> McpServer {
 // MARK: - profiles
 
 #[tokio::test]
+async fn sandbox_sys_info_reports_the_sandbox_tool_list() {
+    use crate::tools::sysinfo::SysInfoTool;
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SysInfoTool {
+            agent_version: "t",
+            tool_names: vec![],
+        }),
+        Arc::new(Fake("exec")),
+        Arc::new(Fake("screenshot")),
+    ];
+    let owner = McpServer::new("t", "0", None, tools);
+    let sandbox = owner.scoped(ToolProfile::Sandbox, None);
+    let call = |s: McpServer| async move {
+        let req = crate::mcp::RpcRequest::from_value(
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sys_info"}}),
+        )
+        .unwrap();
+        s.handle(&req).await.unwrap()["result"]["structuredContent"]["capabilities"]["exec"].clone()
+    };
+    assert_eq!(call(owner).await, true);
+    assert_eq!(
+        call(sandbox).await,
+        false,
+        "sandbox sys_info must not advertise exec"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_drops_every_exec_tool_and_carries_its_own_instructions() {
     let s = full_server().scoped(
         ToolProfile::Sandbox,
@@ -506,9 +534,11 @@ async fn runtime_replaced_redials_with_backoff_until_the_deadline() {
         wait_ended(&h, Duration::from_secs(6)).await,
         State::Ended(Terminal::Deadline)
     );
+    // Each dial attaches, so the backoff restarts at 200 ms every time: about ten dials
+    // in 2.5 s. Without the reset it doubles (0.2, 0.4, 0.8, 1.6 s) and stops near four.
     assert!(
-        rt.upgrades() >= 2,
-        "4006 must redial, got {}",
+        rt.upgrades() >= 6,
+        "4006 must redial with a reset backoff, got {}",
         rt.upgrades()
     );
 }

@@ -121,3 +121,35 @@ pub trait Desktop: Send + Sync {
     /// without a prompt), and the displays if they are known without asking. Never prompts.
     fn facts(&self) -> DesktopFacts;
 }
+
+/// Hold `mods` down while `action` runs, then release exactly the ones that went down, in
+/// reverse order — also when a later press or the action itself failed, so no modifier is
+/// ever left stuck on the user's desktop (every later keystroke would become a chord).
+pub async fn with_modifiers<F, Fut>(
+    d: &dyn Desktop,
+    mods: &[NamedKey],
+    action: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    let mut down = Vec::with_capacity(mods.len());
+    let mut result = Ok(());
+    for m in mods {
+        match d.key(Key::Named(*m), true).await {
+            Ok(()) => down.push(*m),
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    if result.is_ok() {
+        result = action().await;
+    }
+    for m in down.iter().rev() {
+        let _ = d.key(Key::Named(*m), false).await;
+    }
+    result
+}

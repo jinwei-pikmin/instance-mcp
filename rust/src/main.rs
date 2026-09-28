@@ -198,12 +198,12 @@ async fn main() {
     }
 
     let jobs = JobRegistry::new(platform::backend().job_log_dir());
-    let sys_info = Arc::new(SysInfoTool {
-        agent_version: VERSION,
-        tool_names: OnceLock::new(),
-    });
     let mut tools: Vec<Arc<dyn Tool>> = vec![
-        sys_info.clone(),
+        // Its tool list is bound by McpServer::new (and again by each scoped server).
+        Arc::new(SysInfoTool {
+            agent_version: VERSION,
+            tool_names: vec![],
+        }),
         Arc::new(ExecTool),
         Arc::new(ExecStartTool(jobs.clone())),
         Arc::new(ExecPollTool(jobs.clone())),
@@ -226,7 +226,6 @@ async fn main() {
         Some(instructions(desktop.is_some())),
         tools,
     );
-    let _ = sys_info.tool_names.set(server.tool_names());
     let tool_list = server.tool_names().join(",");
     let attach = opts
         .attach

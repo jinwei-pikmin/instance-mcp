@@ -206,7 +206,13 @@ async fn run(
             return;
         }
         set_state(&state, State::Dialing);
-        match dial_once(&cfg, &server, &state, &mut cancel).await {
+        let outcome = dial_once(&cfg, &server, &state, &mut cancel).await;
+        // A connection that got attached was healthy: the next drop starts the backoff
+        // over, instead of inheriting the 30 s ceiling from failures hours ago.
+        if matches!(*state.lock().unwrap(), State::Attached) {
+            backoff = cfg.initial_backoff;
+        }
+        match outcome {
             Disposition::Stop(t) => {
                 log(&format!("attach {}: stopping ({})", cfg.session, t.label()));
                 set_state(&state, State::Ended(t));

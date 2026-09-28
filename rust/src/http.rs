@@ -92,7 +92,8 @@ fn json(status: StatusCode, v: &Value) -> Response {
     (
         status,
         [("content-type", "application/json")],
-        crate::mcp::swift_numbers(v.clone()).to_string(),
+        // MCP results are already normalized in McpServer::handle; nothing else emits floats.
+        v.to_string(),
     )
         .into_response()
 }

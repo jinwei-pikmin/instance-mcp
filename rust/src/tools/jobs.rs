@@ -14,7 +14,9 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{json, Map, Value};
 
-use super::exec::{build_env, exit_code, home_dir, killpg, resolve_cwd, spawn};
+use super::exec::{
+    build_env, exit_code, home_dir, join_within, killpg, resolve_cwd, spawn, PIPE_GRACE,
+};
 use crate::mcp::{arg_f64, arg_i64, arg_str, RpcError, Tool, ToolFail, ToolFuture, ToolResult};
 use crate::platform;
 
@@ -76,21 +78,57 @@ impl Job {
     }
 }
 
-/// Bytes of a log file at offset ≥ `from`, and the offset to pass next time.
-fn read_log(path: &PathBuf, from: u64) -> (Vec<u8>, u64) {
+/// Default and ceiling for how much of each stream one poll returns. Bounded so a noisy
+/// build cannot produce a gigabyte response (or overflow the 16 MiB attach frame).
+const POLL_DEFAULT_BYTES: u64 = 256 * 1024;
+const POLL_MAX_BYTES: u64 = 1024 * 1024;
+/// Longest `exec_start` timeout; beyond this, run without one and use `exec_cancel`.
+const MAX_JOB_TIMEOUT_SECS: f64 = 7.0 * 86400.0;
+
+struct LogChunk {
+    bytes: Vec<u8>,
+    /// Offset to pass as `*_since` next time.
+    next: u64,
+    /// More bytes are already on disk past `next`.
+    more: bool,
+}
+
+/// Up to `max` bytes of a log file from offset `from`. Unless the file is complete
+/// (`finished` and nothing left), a trailing partial UTF-8 character is left for the next
+/// poll, so a character split across two polls is not turned into U+FFFD twice.
+fn read_log(path: &PathBuf, from: u64, max: u64, finished: bool) -> LogChunk {
+    let empty = |next| LogChunk {
+        bytes: Vec::new(),
+        next,
+        more: false,
+    };
     let Ok(mut f) = std::fs::File::open(path) else {
-        return (Vec::new(), from);
+        return empty(from);
     };
     let size = f.metadata().map(|m| m.len()).unwrap_or(0);
     if size <= from {
-        return (Vec::new(), size);
+        return empty(size);
     }
+    let want = (size - from).min(max);
     let mut out = Vec::new();
     if f.seek(SeekFrom::Start(from)).is_ok() {
-        let _ = f.take(size - from).read_to_end(&mut out);
+        let _ = f.take(want).read_to_end(&mut out);
+    }
+    let complete = finished && from + out.len() as u64 >= size;
+    if !complete {
+        if let Err(e) = std::str::from_utf8(&out) {
+            // error_len() == None: the input ended inside a character.
+            if e.error_len().is_none() && out.len() - e.valid_up_to() <= 3 && e.valid_up_to() > 0 {
+                out.truncate(e.valid_up_to());
+            }
+        }
     }
     let next = from + out.len() as u64;
-    (out, next)
+    LogChunk {
+        bytes: out,
+        next,
+        more: next < size,
+    }
 }
 
 fn file_size(path: &PathBuf) -> u64 {
@@ -181,7 +219,11 @@ impl JobRegistry {
         };
 
         let mut child = spawn(command, cwd, env)?;
-        let pid = child.id().unwrap_or(0);
+        // No pid means it already exited and was reaped; a 0 here would later make
+        // exec_cancel signal the daemon's own process group.
+        let pid = child
+            .id()
+            .ok_or("the command exited before it could be tracked")?;
         let job = Arc::new(Job {
             id: id.clone(),
             pid,
@@ -218,8 +260,9 @@ impl JobRegistry {
                     }
                 }
             };
-            let _ = tee_out.await;
-            let _ = tee_err.await;
+            // Stop teeing shortly after exit even if a background process it started still
+            // holds the pipes, so the job does not stay "running" for that process's life.
+            join_within(vec![tee_out, tee_err], PIPE_GRACE).await;
             let (code, signalled) = status.map(exit_code).unwrap_or((-1, false));
             let state = if timed_out || signalled {
                 JobState::Killed
@@ -302,7 +345,7 @@ impl Tool for ExecStartTool {
             "properties": {
                 "command": {"type": "string", "description": format!("Shell command line, run via `{} -c`.", platform::backend().shell().0)},
                 "cwd": {"type": "string", "description": "Working directory (a leading ~ is expanded). Default: user's home."},
-                "timeout_secs": {"type": "number", "description": "Kill the job after this many seconds. 0 = no timeout (stop it with exec_cancel). Default 0."},
+                "timeout_secs": {"type": "number", "description": "Kill the job after this many seconds (max 604800 = 7 days). 0 = no timeout (stop it with exec_cancel). Default 0."},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Extra environment variables."},
             },
             "required": ["command"],
@@ -313,7 +356,9 @@ impl Tool for ExecStartTool {
             let command = arg_str(args, "command")
                 .filter(|c| !c.is_empty())
                 .ok_or_else(|| RpcError::invalid_params("command is required"))?;
-            let timeout = arg_f64(args, "timeout_secs").unwrap_or(0.0).max(0.0);
+            let timeout = arg_f64(args, "timeout_secs")
+                .unwrap_or(0.0)
+                .clamp(0.0, MAX_JOB_TIMEOUT_SECS);
             let cwd =
                 resolve_cwd(arg_str(args, "cwd").unwrap_or(&home_dir())).map_err(ToolFail::Tool)?;
             let job = self
@@ -344,7 +389,9 @@ impl Tool for ExecPollTool {
             "Fetch a background job's state and any output produced since your last poll. Pass the \
              `job_id` from exec_start and, to get only new output, the `stdout_since`/`stderr_since` \
              byte offsets returned by the previous poll. When `state` is `exited` or `killed`, \
-             `exit_code` is set and no more output will appear. Output is read from the job's log \
+             `exit_code` is set and no more output will appear. Each poll returns at most \
+             `max_bytes` per stream (default 256 KiB, max 1 MiB); when `stdout_more`/`stderr_more` \
+             is true, poll again from `stdout_next`/`stderr_next`. Output is read from the job's log \
              files (never truncated); terminal-job metadata is retained ~10 min, and the log files \
              themselves persist on disk ({}/<job_id>.out/.err).",
             self.0.log_dir.display()
@@ -357,6 +404,7 @@ impl Tool for ExecPollTool {
                 "job_id": {"type": "string"},
                 "stdout_since": {"type": "integer", "description": "Byte offset from a prior poll; omit for all stdout."},
                 "stderr_since": {"type": "integer", "description": "Byte offset from a prior poll; omit for all stderr."},
+                "max_bytes": {"type": "integer", "description": "Per-stream cap for this poll. Default 262144, max 1048576."},
             },
             "required": ["job_id"],
         })
@@ -374,10 +422,16 @@ impl Tool for ExecPollTool {
             let state = job.state();
             let code = job.exit_code();
             let since = |k| arg_i64(args, k).unwrap_or(0).max(0) as u64;
-            let (out, out_next) = read_log(&job.out_path, since("stdout_since"));
-            let (err, err_next) = read_log(&job.err_path, since("stderr_since"));
-            let stdout = String::from_utf8_lossy(&out).into_owned();
-            let stderr = String::from_utf8_lossy(&err).into_owned();
+            let max = arg_i64(args, "max_bytes")
+                .map(|m| m.max(1) as u64)
+                .unwrap_or(POLL_DEFAULT_BYTES)
+                .min(POLL_MAX_BYTES);
+            let finished = state != JobState::Running;
+            let out = read_log(&job.out_path, since("stdout_since"), max, finished);
+            let err = read_log(&job.err_path, since("stderr_since"), max, finished);
+            let (out_next, err_next, out_more, err_more) = (out.next, err.next, out.more, err.more);
+            let stdout = String::from_utf8_lossy(&out.bytes).into_owned();
+            let stderr = String::from_utf8_lossy(&err.bytes).into_owned();
 
             let mut s = Map::new();
             s.insert("job_id".into(), json!(id));
@@ -386,6 +440,8 @@ impl Tool for ExecPollTool {
             s.insert("stderr".into(), json!(stderr));
             s.insert("stdout_next".into(), json!(out_next));
             s.insert("stderr_next".into(), json!(err_next));
+            s.insert("stdout_more".into(), json!(out_more));
+            s.insert("stderr_more".into(), json!(err_more));
             s.insert("out_path".into(), json!(job.out_path));
             s.insert("err_path".into(), json!(job.err_path));
             if let Some(c) = code {
@@ -399,10 +455,14 @@ impl Tool for ExecPollTool {
                     if text.is_empty() { "" } else { "\n" }
                 );
             }
-            let trailer = match code {
-                Some(c) => format!("[{} exit {c}]", state.as_str()),
-                None => format!("[{}]", state.as_str()),
+            let mut trailer = match code {
+                Some(c) => format!("[{} exit {c}", state.as_str()),
+                None => format!("[{}", state.as_str()),
             };
+            if out_more || err_more {
+                trailer += &format!("; more output: poll again with stdout_since={out_next} stderr_since={err_next}");
+            }
+            trailer += "]";
             text += &format!("{}{trailer}", if text.is_empty() { "" } else { "\n" });
             Ok(ToolResult::text(text, Some(Value::Object(s))))
         })
@@ -562,10 +622,64 @@ mod tests {
             .unwrap();
         let j = wait_done(&reg, &job.id).await;
         assert_eq!((j.state(), j.exit_code()), (JobState::Exited, Some(4)));
-        assert_eq!(read_log(&j.out_path, 0), (b"abc".to_vec(), 3));
-        assert_eq!(read_log(&j.out_path, 1), (b"bc".to_vec(), 3));
-        assert_eq!(read_log(&j.out_path, 3), (vec![], 3));
-        assert_eq!(read_log(&j.err_path, 0).0, b"def");
+        let rd = |p, from| {
+            let c = read_log(p, from, POLL_DEFAULT_BYTES, true);
+            (c.bytes, c.next)
+        };
+        assert_eq!(rd(&j.out_path, 0), (b"abc".to_vec(), 3));
+        assert_eq!(rd(&j.out_path, 1), (b"bc".to_vec(), 3));
+        assert_eq!(rd(&j.out_path, 3), (vec![], 3));
+        assert_eq!(rd(&j.err_path, 0).0, b"def");
+    }
+
+    #[test]
+    fn polls_are_capped_and_never_split_a_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.out");
+        std::fs::write(&p, "ab中文").unwrap(); // a b [e4 b8 ad] [e6 96 87]
+                                               // Cap lands inside 中 (bytes 2..5): keep only "ab" and resume at 2.
+        let c = read_log(&p, 0, 4, false);
+        assert_eq!((c.bytes.as_slice(), c.next, c.more), (&b"ab"[..], 2, true));
+        let c = read_log(&p, 2, 4, false);
+        assert_eq!(
+            (String::from_utf8(c.bytes).unwrap().as_str(), c.next, c.more),
+            ("中", 5, true)
+        );
+        let c = read_log(&p, 5, 64, true);
+        assert_eq!(
+            (String::from_utf8(c.bytes).unwrap().as_str(), c.next, c.more),
+            ("文", 8, false)
+        );
+        // A finished file ending in a broken byte is still returned, so polling can finish.
+        std::fs::write(&p, b"ok\xe4").unwrap();
+        assert_eq!(read_log(&p, 0, 64, true).next, 3);
+    }
+
+    #[tokio::test]
+    async fn huge_timeouts_are_clamped_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = ExecStartTool(JobRegistry::new(dir.path().into()));
+        let r = t
+            .call(&json!({"command": "true", "timeout_secs": 1e20, "cwd": "/"}))
+            .await;
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_background_child_does_not_keep_the_job_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = JobRegistry::new(dir.path().into());
+        let job = reg
+            .start(
+                "echo up; sleep 30 &",
+                "/",
+                &build_env(&json!({})),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let j = wait_done(&reg, &job.id).await; // panics after ~5 s if still running
+        assert_eq!((j.state(), j.exit_code()), (JobState::Exited, Some(0)));
+        assert_eq!(read_log(&j.out_path, 0, 64, true).bytes, b"up\n");
     }
 
     #[tokio::test]

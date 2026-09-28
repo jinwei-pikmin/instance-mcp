@@ -131,5 +131,13 @@ mod tests {
             assert!(!facts["permissions"][k].is_null(), "permissions lacks {k}");
         }
         assert!(lines.last().unwrap().ends_with("test"));
+        // No desktop tools in the list ⇒ no desktop facts, whatever the session has.
+        assert_eq!(facts["desktop"], Value::Null);
+        assert_eq!(facts["displays"], serde_json::json!([]));
+        assert_eq!(facts["permissions"]["screen_recording"], false);
+        // A list without exec (the sandbox profile) must not be told to use exec.
+        let (facts, lines) = b.describe("test", &["sys_info", "screenshot"]);
+        assert_eq!(facts["capabilities"]["exec"], false);
+        assert!(lines.iter().all(|l| !l.contains("exec")), "{lines:?}");
     }
 }

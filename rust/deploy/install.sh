@@ -46,8 +46,16 @@ sed "s|@ALLOW_LOGIN@|$allow_login|" "$here/oab-instance-mcp.service" > "$unit_di
 systemctl --user daemon-reload
 systemctl --user enable oab-instance-mcp.service >/dev/null
 systemctl --user restart oab-instance-mcp.service
-sleep 1
-curl -fsS "http://127.0.0.1:$local_port/healthz" >/dev/null && echo "healthz ok"
+# `a && b` does not trip `set -e`, so check explicitly (and give the service a moment).
+for _ in $(seq 10); do
+  curl -fsS "http://127.0.0.1:$local_port/healthz" >/dev/null 2>&1 && break
+  sleep 0.5
+done
+if ! curl -fsS "http://127.0.0.1:$local_port/healthz" >/dev/null 2>&1; then
+  echo "service did not come up; see: journalctl --user -u oab-instance-mcp -n 50" >&2
+  exit 1
+fi
+echo "healthz ok"
 
 echo "==> tailscale serve :$https_port -> 127.0.0.1:$local_port"
 if tailscale serve status --json 2>/dev/null | python3 -c '

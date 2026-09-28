@@ -26,7 +26,7 @@ use zbus::{Connection, Proxy};
 
 use crate::log;
 use crate::platform::desktop::{
-    Button, Capture, Desktop, DesktopFacts, DesktopFuture, Display, Key, NamedKey,
+    with_modifiers, Button, Capture, Desktop, DesktopFacts, DesktopFuture, Display, Key, NamedKey,
 };
 
 const DEST: &str = "org.freedesktop.portal.Desktop";
@@ -673,9 +673,14 @@ impl Desktop for Portal {
                 .map_err(|e| format!("read {}: {e}", path.display()));
             // The portal saved it into the user's files; it was only ever ours to read.
             let _ = tokio::fs::remove_file(&path).await;
-            let image = image::load_from_memory(&bytes?)
-                .map_err(|e| format!("decode screenshot: {e}"))?
-                .to_rgba8();
+            // PNG decode of a HiDPI desktop is CPU-heavy: off the async workers.
+            let bytes = bytes?;
+            let image = tokio::task::spawn_blocking(move || {
+                image::load_from_memory(&bytes).map(|i| i.to_rgba8())
+            })
+            .await
+            .map_err(|e| format!("decode worker failed: {e}"))?
+            .map_err(|e| format!("decode screenshot: {e}"))?;
 
             // Place the displays in image space: shift the layout so its bounding box
             // starts at (0,0), and derive the pixel density from the width.
@@ -794,13 +799,10 @@ impl Desktop for Portal {
             if c.is_ascii() {
                 return tap(Key::Char(c)).await;
             }
-            let (ctrl, shift) = (Key::Named(NamedKey::Ctrl), Key::Named(NamedKey::Shift));
-            self.key(ctrl, true).await?;
-            self.key(shift, true).await?;
-            let u = tap(Key::Char('u')).await;
-            let _ = self.key(shift, false).await;
-            let _ = self.key(ctrl, false).await;
-            u?;
+            with_modifiers(self, &[NamedKey::Ctrl, NamedKey::Shift], || {
+                tap(Key::Char('u'))
+            })
+            .await?;
             // The input method must see the entry start (and later the commit) before the
             // next keys; without these pauses every other character comes out as raw hex.
             tokio::time::sleep(UNICODE_ENTRY_PAUSE).await;

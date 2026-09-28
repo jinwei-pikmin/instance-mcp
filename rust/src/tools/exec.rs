@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -92,7 +93,12 @@ pub fn spawn(command: &str, cwd: &str, env: &HashMap<String, String>) -> Result<
     cmd.spawn().map_err(|e| format!("spawn failed: {e}"))
 }
 
+/// Signal a process group we created. Refuses pid 0, which `killpg` would read as "the
+/// caller's own group" — the daemon itself.
 pub fn killpg(pid: u32, sig: i32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     // SAFETY: plain syscall; pid is a session leader we spawned.
     unsafe { libc::killpg(pid as libc::pid_t, sig) == 0 }
 }
@@ -107,25 +113,46 @@ pub fn exit_code(st: ExitStatus) -> (i32, bool) {
     }
 }
 
-/// Read a stream to EOF, keeping at most `cap` bytes (the rest is drained and dropped so
-/// the child never blocks on a full pipe).
-async fn read_capped(mut r: impl AsyncRead + Unpin, cap: usize) -> (Vec<u8>, bool) {
-    let mut out = Vec::new();
-    let mut truncated = false;
+/// How long to keep reading after the command itself has exited. Pipes normally hit EOF
+/// at once; if they do not, a background process it started (`firefox &`, `nohup … &`)
+/// inherited them and may hold them for hours, so we stop waiting.
+pub const PIPE_GRACE: Duration = Duration::from_millis(300);
+
+#[derive(Default)]
+struct Collected {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+/// Read a stream into `into`, keeping at most `cap` bytes (the rest is drained and dropped
+/// so the child never blocks on a full pipe). Shared so a caller that stops waiting still
+/// has everything read so far.
+async fn read_capped(mut r: impl AsyncRead + Unpin, cap: usize, into: Arc<Mutex<Collected>>) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match r.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let room = cap.saturating_sub(out.len());
+                let mut c = into.lock().unwrap();
+                let room = cap.saturating_sub(c.bytes.len());
                 if n > room {
-                    truncated = true;
+                    c.truncated = true;
                 }
-                out.extend_from_slice(&buf[..n.min(room)]);
+                c.bytes.extend_from_slice(&buf[..n.min(room)]);
             }
         }
     }
-    (out, truncated)
+}
+
+/// Wait up to `grace` for every task; abort the stragglers. True if all finished.
+pub async fn join_within(tasks: Vec<tokio::task::JoinHandle<()>>, grace: Duration) -> bool {
+    let aborts: Vec<_> = tasks.iter().map(|t| t.abort_handle()).collect();
+    let all = futures_util::future::join_all(tasks);
+    if tokio::time::timeout(grace, all).await.is_ok() {
+        return true;
+    }
+    aborts.iter().for_each(|a| a.abort());
+    false
 }
 
 pub struct Outcome {
@@ -135,6 +162,9 @@ pub struct Outcome {
     pub stderr: String,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// A background process still held stdout/stderr when the command exited; output it
+    /// writes later is not captured.
+    pub output_detached: bool,
     pub duration: Duration,
 }
 
@@ -150,8 +180,14 @@ pub async fn run(
     let pid = child
         .id()
         .ok_or("child exited before it could be tracked")?;
-    let out = tokio::spawn(read_capped(child.stdout.take().unwrap(), cap));
-    let err = tokio::spawn(read_capped(child.stderr.take().unwrap(), cap));
+    let (out, err) = (
+        Arc::new(Mutex::new(Collected::default())),
+        Arc::new(Mutex::new(Collected::default())),
+    );
+    let readers = vec![
+        tokio::spawn(read_capped(child.stdout.take().unwrap(), cap, out.clone())),
+        tokio::spawn(read_capped(child.stderr.take().unwrap(), cap, err.clone())),
+    ];
 
     let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(st) => (st.map_err(|e| e.to_string())?, false),
@@ -160,16 +196,21 @@ pub async fn run(
             (child.wait().await.map_err(|e| e.to_string())?, true)
         }
     };
-    // Pipes reach EOF once every writer in the (now dead) session has exited.
-    let (out, out_t) = out.await.unwrap_or_default();
-    let (err, err_t) = err.await.unwrap_or_default();
+    // Pipes reach EOF once every writer has exited — unless something outlived the shell.
+    let output_detached = !join_within(readers, PIPE_GRACE).await;
+    let take = |c: &Arc<Mutex<Collected>>| {
+        let c = c.lock().unwrap();
+        (String::from_utf8_lossy(&c.bytes).into_owned(), c.truncated)
+    };
+    let ((stdout, stdout_truncated), (stderr, stderr_truncated)) = (take(&out), take(&err));
     Ok(Outcome {
         exit_code: exit_code(status).0,
         timed_out,
-        stdout: String::from_utf8_lossy(&out).into_owned(),
-        stderr: String::from_utf8_lossy(&err).into_owned(),
-        stdout_truncated: out_t,
-        stderr_truncated: err_t,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        output_detached,
         duration: start.elapsed(),
     })
 }
@@ -237,6 +278,9 @@ impl Tool for ExecTool {
             if r.stdout_truncated || r.stderr_truncated {
                 trailer += ", output truncated";
             }
+            if r.output_detached {
+                trailer += ", a background process kept the output open; later output not captured";
+            }
             trailer += "]";
             text += &format!("{}{trailer}", if text.is_empty() { "" } else { "\n" });
 
@@ -245,6 +289,7 @@ impl Tool for ExecTool {
                 "timed_out": r.timed_out,
                 "stdout": r.stdout, "stderr": r.stderr,
                 "stdout_truncated": r.stdout_truncated, "stderr_truncated": r.stderr_truncated,
+                "output_detached": r.output_detached,
                 "duration_ms": r.duration.as_millis() as u64,
             });
             let mut res = ToolResult::text(text, Some(structured));
@@ -282,6 +327,45 @@ mod tests {
             ),
             (3, "hi\n", "oops\n", false)
         );
+    }
+
+    #[tokio::test]
+    async fn background_process_holding_the_pipe_does_not_hang_exec() {
+        // `app &` leaves a grandchild holding stdout after the shell exits: return promptly
+        // with what was printed, and say the output was left behind.
+        let t = Instant::now();
+        let r = run(
+            "echo started; sleep 30 &",
+            "/",
+            &env(),
+            Duration::from_secs(20),
+            1024,
+        )
+        .await
+        .unwrap();
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            t.elapsed()
+        );
+        assert_eq!(
+            (r.exit_code, r.timed_out, r.stdout.as_str()),
+            (0, false, "started\n")
+        );
+        assert!(r.output_detached);
+        // A plain command is not flagged.
+        assert!(
+            !run("echo hi", "/", &env(), Duration::from_secs(5), 1024)
+                .await
+                .unwrap()
+                .output_detached
+        );
+    }
+
+    #[test]
+    fn killpg_refuses_pid_zero() {
+        // pid 0 would mean the daemon's own process group.
+        assert!(!killpg(0, 0));
     }
 
     #[tokio::test]

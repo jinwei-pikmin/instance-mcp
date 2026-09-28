@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::mcp::{
     arg_f64, arg_i64, arg_str, Content, RpcError, Tool, ToolFail, ToolFuture, ToolResult,
 };
-use crate::platform::desktop::{Button, Desktop, Key, NamedKey};
+use crate::platform::desktop::{with_modifiers, Button, Desktop, Key, NamedKey};
 
 async fn sleep_ms(ms: u64) {
     tokio::time::sleep(Duration::from_millis(ms)).await;
@@ -109,6 +109,7 @@ impl Tool for ScreenshotTool {
             let d = usize::try_from(index)
                 .ok()
                 .and_then(|i| cap.displays.get(i))
+                .cloned()
                 .ok_or_else(|| {
                     fail(format!(
                         "display {index} out of range; {} display(s) available",
@@ -127,41 +128,52 @@ impl Tool for ScreenshotTool {
                     .ok_or_else(|| fail(format!("region lies outside display {index}")))?,
                 None => whole,
             };
+            let (iw, ih) = (cap.image.width(), cap.image.height());
+            if iw == 0 || ih == 0 {
+                return Err(fail("the desktop returned an empty screenshot".into()));
+            }
 
             // Points → source pixels (the capture spans the whole layout).
             let ppp = cap.pixels_per_point;
-            let (iw, ih) = (cap.image.width(), cap.image.height());
             let px = ((d.x + r.x) * ppp).round().clamp(0.0, iw as f64 - 1.0) as u32;
             let py = ((d.y + r.y) * ppp).round().clamp(0.0, ih as f64 - 1.0) as u32;
             let pw = ((r.w * ppp).round() as u32).clamp(1, iw - px);
             let ph = ((r.h * ppp).round() as u32).clamp(1, ih - py);
-            let cropped = image::imageops::crop_imm(&cap.image, px, py, pw, ph).to_image();
             let (ow, oh) = (
                 ((r.w * scale).round() as u32).max(1),
                 ((r.h * scale).round() as u32).max(1),
             );
-            let out = if (ow, oh) == (pw, ph) {
-                cropped
-            } else {
-                image::imageops::resize(&cropped, ow, oh, FilterType::Triangle)
-            };
-
-            let mut buf = Vec::new();
-            let mime = if png {
-                image::codecs::png::PngEncoder::new(Cursor::new(&mut buf))
-                    .write_image(out.as_raw(), ow, oh, image::ExtendedColorType::Rgba8)
-                    .map_err(|e| fail(format!("png encode: {e}")))?;
-                "image/png"
-            } else {
-                let rgb = DynamicImage::ImageRgba8(out).to_rgb8();
-                image::codecs::jpeg::JpegEncoder::new_with_quality(
-                    &mut buf,
-                    (quality * 100.0).round() as u8,
-                )
-                .write_image(rgb.as_raw(), ow, oh, image::ExtendedColorType::Rgb8)
-                .map_err(|e| fail(format!("jpeg encode: {e}")))?;
-                "image/jpeg"
-            };
+            // Crop, resample and encode are hundreds of ms of CPU on a large capture: keep
+            // them off the async workers that serve every other request and attach frame.
+            let image = cap.image;
+            let (buf, mime) =
+                tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, &'static str), String> {
+                    let cropped = image::imageops::crop_imm(&image, px, py, pw, ph).to_image();
+                    let out = if (ow, oh) == (pw, ph) {
+                        cropped
+                    } else {
+                        image::imageops::resize(&cropped, ow, oh, FilterType::Triangle)
+                    };
+                    let mut buf = Vec::new();
+                    if png {
+                        image::codecs::png::PngEncoder::new(Cursor::new(&mut buf))
+                            .write_image(out.as_raw(), ow, oh, image::ExtendedColorType::Rgba8)
+                            .map_err(|e| format!("png encode: {e}"))?;
+                        Ok((buf, "image/png"))
+                    } else {
+                        let rgb = DynamicImage::ImageRgba8(out).to_rgb8();
+                        image::codecs::jpeg::JpegEncoder::new_with_quality(
+                            &mut buf,
+                            (quality * 100.0).round() as u8,
+                        )
+                        .write_image(rgb.as_raw(), ow, oh, image::ExtendedColorType::Rgb8)
+                        .map_err(|e| format!("jpeg encode: {e}"))?;
+                        Ok((buf, "image/jpeg"))
+                    }
+                })
+                .await
+                .map_err(|e| fail(format!("image worker failed: {e}")))?
+                .map_err(fail)?;
 
             let crop = if region.is_some() {
                 format!(
@@ -286,20 +298,12 @@ fn parse_combo(s: &str) -> Result<Combo, String> {
 }
 
 async fn tap(d: &dyn Desktop, c: &Combo) -> Result<(), String> {
-    for m in &c.mods {
-        d.key(Key::Named(*m), true).await?;
-    }
-    let r = async {
+    with_modifiers(d, &c.mods, || async {
         d.key(c.key, true).await?;
         sleep_ms(15).await;
         d.key(c.key, false).await
-    }
-    .await;
-    // Always release modifiers, even if the key failed, so none stays stuck down.
-    for m in c.mods.iter().rev() {
-        let _ = d.key(Key::Named(*m), false).await;
-    }
-    r
+    })
+    .await
 }
 
 pub struct KeyTool(pub Arc<dyn Desktop>);
@@ -463,11 +467,8 @@ impl Tool for MouseTool {
                     };
                     d.pointer_move(display, x, y).await.map_err(fail)?;
                     sleep_ms(30).await;
-                    for m in &mods {
-                        d.key(Key::Named(*m), true).await.map_err(fail)?;
-                    }
                     let clicks = if action == "double_click" { 2 } else { 1 };
-                    let r = async {
+                    with_modifiers(d, &mods, || async {
                         for i in 0..clicks {
                             d.button(button, true).await?;
                             sleep_ms(20).await;
@@ -476,13 +477,10 @@ impl Tool for MouseTool {
                                 sleep_ms(60).await;
                             }
                         }
-                        Ok::<(), String>(())
-                    }
-                    .await;
-                    for m in mods.iter().rev() {
-                        let _ = d.key(Key::Named(*m), false).await;
-                    }
-                    r.map_err(fail)?;
+                        Ok(())
+                    })
+                    .await
+                    .map_err(fail)?;
                     let with = if mods.is_empty() {
                         ""
                     } else {
@@ -557,7 +555,8 @@ mod tests {
 
     /// Records every event; capture is a 2-display layout at 2 px/pt with a marked pixel.
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<String>>);
+    /// `.1`: an event (e.g. "Named(Shift) down") that fails, to test cleanup paths.
+    struct Recorder(Mutex<Vec<String>>, Option<&'static str>);
 
     impl Desktop for Recorder {
         fn mechanism(&self) -> &'static str {
@@ -566,6 +565,20 @@ mod tests {
         fn capture(&self) -> DesktopFuture<'_, Capture> {
             Box::pin(async {
                 // Layout: display 0 = 100×50 pt at (0,0); display 1 = 50×50 pt at (100,0).
+                if self.1 == Some("capture:empty") {
+                    return Ok(Capture {
+                        image: image::RgbaImage::new(0, 0),
+                        pixels_per_point: 1.0,
+                        displays: vec![Display {
+                            index: 0,
+                            x: 0.0,
+                            y: 0.0,
+                            width: 10.0,
+                            height: 10.0,
+                            scale: 1.0,
+                        }],
+                    });
+                }
                 let mut image = image::RgbaImage::new(300, 100);
                 image.put_pixel(220, 20, image::Rgba([255, 0, 0, 255])); // display 1, point (10,10)
                 Ok(Capture {
@@ -611,11 +624,16 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
         fn key(&self, k: Key, down: bool) -> DesktopFuture<'_, ()> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("{k:?} {}", if down { "down" } else { "up" }));
-            Box::pin(async { Ok(()) })
+            let ev = format!("{k:?} {}", if down { "down" } else { "up" });
+            let fails = self.1 == Some(ev.as_str());
+            self.0.lock().unwrap().push(ev);
+            Box::pin(async move {
+                if fails {
+                    Err("injected failure".into())
+                } else {
+                    Ok(())
+                }
+            })
         }
         fn status(&self) -> String {
             String::new()
@@ -689,6 +707,48 @@ mod tests {
             .call(&json!({"region": {"x": 500, "y": 0, "width": 10, "height": 10}}))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_failed_modifier_press_still_releases_the_ones_already_down() {
+        for tool in ["key", "mouse"] {
+            let r = Arc::new(Recorder(Mutex::default(), Some("Named(Shift) down")));
+            let res = if tool == "key" {
+                KeyTool(r.clone())
+                    .call(&json!({"action": "press", "keys": ["ctrl+shift+t"]}))
+                    .await
+            } else {
+                MouseTool(r.clone())
+                    .call(
+                        &json!({"action": "click", "x": 1, "y": 1, "modifiers": ["ctrl", "shift"]}),
+                    )
+                    .await
+            };
+            assert!(res.is_err());
+            let ev = events(&r);
+            assert_eq!(
+                ev.last().map(String::as_str),
+                Some("Named(Ctrl) up"),
+                "{tool}: {ev:?}"
+            );
+            assert!(
+                !ev.iter().any(|e| e == "Named(Shift) up"),
+                "shift never went down"
+            );
+            assert!(
+                !ev.iter().any(|e| e.contains("Left") || e.contains("Char")),
+                "action skipped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_capture_is_an_error_not_a_panic() {
+        let t = ScreenshotTool(Arc::new(Recorder(Mutex::default(), Some("capture:empty"))));
+        match t.call(&json!({})).await {
+            Err(ToolFail::Tool(m)) => assert!(m.contains("empty"), "{m}"),
+            _ => panic!("expected a tool error"),
+        }
     }
 
     #[tokio::test]
