@@ -4,6 +4,8 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    # Retry only. Dispatch ON THE TAG REF (`gh workflow run release.yml --ref vX.Y.Z -f tag=vX.Y.Z`):
+    # the `release` environment allows v* refs only, so a dispatch from main is rejected.
     inputs:
       tag:
         description: "Existing v* tag to release (for retry only)"
@@ -227,7 +229,7 @@ jobs:
           done
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null || {
             echo "release $RELEASE_TAG does not exist after 30 min; did the macOS job fail or get rejected?" >&2
-            echo "Retry with: gh workflow run release.yml -f tag=$RELEASE_TAG" >&2
+            echo "Retry with: gh workflow run release.yml --ref $RELEASE_TAG -f tag=$RELEASE_TAG" >&2
             exit 1
           }
           gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber \
