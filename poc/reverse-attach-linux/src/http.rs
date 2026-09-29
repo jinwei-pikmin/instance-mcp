@@ -193,6 +193,9 @@ pub(crate) struct HttpRequest {
     pub(crate) body: String,
     pub(crate) authorization: Option<String>,
     pub(crate) ts_login: Option<String>,
+    /// Present when the request was relayed by `tailscale serve` (or any proxy);
+    /// such a request is never "local", whatever its TCP peer says.
+    pub(crate) forwarded_for: Option<String>,
     pub(crate) peer_is_loopback: bool,
 }
 
@@ -231,6 +234,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut content_length: usize = 0;
     let mut authorization = None;
     let mut ts_login = None;
+    let mut forwarded_for = None;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
             let name = name.trim();
@@ -241,6 +245,8 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
                 authorization = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("tailscale-user-login") {
                 ts_login = Some(value.to_string());
+            } else if name.eq_ignore_ascii_case("x-forwarded-for") {
+                forwarded_for = Some(value.to_string());
             }
         }
     }
@@ -280,6 +286,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         body,
         authorization,
         ts_login,
+        forwarded_for,
         peer_is_loopback,
     })
 }

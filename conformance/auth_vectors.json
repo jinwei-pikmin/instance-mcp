@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "description": "Conformance vectors for AuthPolicy.decide(). Oracle: Swift AuthPolicy.swift. Any impl must match.",
+  "cases": [
+    {"name": "no-auth-configured validate() must fail", "config": {"allowedLogins": [], "bearerToken": null, "allowLocalUnauthenticated": false}, "validate": "error"},
+    {"name": "token ok -> allow token", "config": {"bearerToken": "s3cret"}, "headers": {"authorization": "Bearer s3cret"}, "remoteIsLoopback": true, "expect": {"allow": "token"}},
+    {"name": "token missing header -> deny", "config": {"bearerToken": "s3cret"}, "headers": {}, "remoteIsLoopback": true, "expect": {"deny": "missing Authorization header"}},
+    {"name": "token wrong -> deny bad token", "config": {"bearerToken": "s3cret"}, "headers": {"authorization": "Bearer nope"}, "remoteIsLoopback": true, "expect": {"deny": "bad token"}},
+    {"name": "token wrong length -> deny (constant-time len check)", "config": {"bearerToken": "s3cret"}, "headers": {"authorization": "Bearer s3"}, "remoteIsLoopback": true, "expect": {"deny": "bad token"}},
+    {"name": "auth not Bearer -> deny", "config": {"bearerToken": "s3cret"}, "headers": {"authorization": "Basic s3cret"}, "remoteIsLoopback": true, "expect": {"deny": "Authorization must be Bearer"}},
+    {"name": "Bearer prefix case-insensitive", "config": {"bearerToken": "s3cret"}, "headers": {"authorization": "bEaReR s3cret"}, "remoteIsLoopback": true, "expect": {"allow": "token"}},
+    {"name": "wrong token beats allowlisted login (bearer checked first)", "config": {"allowedLogins": ["you@example.com"], "bearerToken": "s3cret"}, "headers": {"authorization": "Bearer nope", "tailscale-user-login": "you@example.com"}, "remoteIsLoopback": true, "expect": {"deny": "bad token"}},
+    {"name": "login allowed", "config": {"allowedLogins": ["you@example.com"]}, "headers": {"tailscale-user-login": "you@example.com"}, "remoteIsLoopback": true, "expect": {"allow": "you@example.com"}},
+    {"name": "login allowed case-insensitive", "config": {"allowedLogins": ["you@example.com"]}, "headers": {"tailscale-user-login": "YOU@Example.com"}, "remoteIsLoopback": true, "expect": {"allow": "you@example.com"}},
+    {"name": "login not in allowlist -> deny", "config": {"allowedLogins": ["you@example.com"]}, "headers": {"tailscale-user-login": "evil@example.com"}, "remoteIsLoopback": true, "expect": {"deny": "login evil@example.com not allowed"}},
+    {"name": "allowlist set but no identity -> deny", "config": {"allowedLogins": ["you@example.com"]}, "headers": {}, "remoteIsLoopback": true, "expect": {"deny": "no Tailscale identity on request"}},
+    {"name": "allowlist + no identity + loopback + insecure-local -> allow local", "config": {"allowedLogins": ["you@example.com"], "allowLocalUnauthenticated": true}, "headers": {}, "remoteIsLoopback": true, "expect": {"allow": "local"}},
+    {"name": "insecure-local but has x-forwarded-for -> deny (not truly local)", "config": {"allowedLogins": ["you@example.com"], "allowLocalUnauthenticated": true}, "headers": {"x-forwarded-for": "1.2.3.4"}, "remoteIsLoopback": true, "expect": {"deny": "no Tailscale identity on request"}},
+    {"name": "insecure-local only, loopback, no headers -> allow local", "config": {"allowLocalUnauthenticated": true}, "headers": {}, "remoteIsLoopback": true, "expect": {"allow": "local"}},
+    {"name": "insecure-local only but not loopback -> deny", "config": {"allowLocalUnauthenticated": true}, "headers": {}, "remoteIsLoopback": false, "expect": {"deny": "unauthenticated"}}
+  ]
+}

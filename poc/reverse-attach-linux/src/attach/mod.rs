@@ -134,3 +134,82 @@ pub(crate) fn disposition_handshake(status: u16) -> Disposition {
 }
 
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod conformance {
+    //! `conformance/reverse_attach_vectors.json` — Swift `ReverseAttachClient`
+    //! (`disposition(closeCode:)`, `disposition(handshakeStatus:)`, `attachURL`)
+    //! is the oracle; the Swift test target reads the same file.
+    use super::*;
+    use serde_json::Value;
+
+    const VECTORS: &str = include_str!("../../../../conformance/reverse_attach_vectors.json");
+
+    /// The oracle names terminals in Swift case style; this crate reports the
+    /// snake_case `ended` reasons of the Connect `MacGrant` contract.
+    fn stop_reason(swift: &str) -> &'static str {
+        match swift {
+            "grantExpired" => "grant_expired",
+            "replaced" => "replaced",
+            "sessionEnded" => "session_ended",
+            "revoked" => "revoked",
+            other => panic!("unknown terminal in vectors: {other}"),
+        }
+    }
+
+    fn describe(d: &Disposition) -> String {
+        match d {
+            Disposition::Stop(r) => format!("stop({r})"),
+            Disposition::Redial => "redial".into(),
+        }
+    }
+
+    #[test]
+    fn disposition_and_attach_url_match_the_swift_oracle_vectors() {
+        let doc: Value = serde_json::from_str(VECTORS).unwrap();
+        let mut failures = Vec::new();
+        let mut n = 0;
+
+        for c in doc["close_code"].as_array().unwrap() {
+            n += 1;
+            let code = c["code"].as_u64().unwrap() as u16;
+            let got = describe(&disposition_close(code));
+            let want = match c["expect"]["stop"].as_str() {
+                Some(s) => format!("stop({})", stop_reason(s)),
+                None => "redial".into(),
+            };
+            if got != want {
+                failures.push(format!("close {code}: got {got}, want {want}"));
+            }
+        }
+        for c in doc["handshake_status"].as_array().unwrap() {
+            n += 1;
+            let status = c["status"].as_u64().unwrap() as u16;
+            let got = describe(&disposition_handshake(status));
+            let want = match c["expect"]["stop_rejected"].as_u64() {
+                Some(s) => format!("stop(handshake_rejected_{s})"),
+                None => "redial".into(),
+            };
+            if got != want {
+                failures.push(format!("handshake {status}: got {got}, want {want}"));
+            }
+        }
+        for c in doc["attach_url"].as_array().unwrap() {
+            n += 1;
+            let got = attach_url(
+                c["runtime"].as_str().unwrap(),
+                c["session"].as_str().unwrap(),
+            );
+            let want = c["expect"].as_str().unwrap();
+            if got != want {
+                failures.push(format!("attach_url: got {got}, want {want}"));
+            }
+        }
+        assert!(n >= 23, "vector file shrank: {n}");
+        assert!(
+            failures.is_empty(),
+            "drift from Swift oracle:\n{}",
+            failures.join("\n")
+        );
+    }
+}

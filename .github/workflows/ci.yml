@@ -102,6 +102,9 @@ jobs:
         run: cargo clippy --release -- -D warnings
       - name: Build
         run: cargo build --release
+      - name: Unit + conformance tests
+        # Includes conformance/*.json, shared with the Swift test target (oracle).
+        run: cargo test --release
       - name: Smoke (mock runtime, loopback)
         # Exercises /attach, mint, disposition, MCP dispatch and bash; the
         # screenshot/mouse/key tools are listed but not invoked (no seat here).

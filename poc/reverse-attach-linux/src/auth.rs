@@ -38,6 +38,17 @@ impl AuthPolicy {
             std::env::var("MCP_INSECURE_LOCAL").as_deref(),
             Ok("1") | Ok("true")
         );
+        Self::new(token, allow_logins, insecure_local)
+    }
+
+    /// Refuses a policy with nothing configured, like Swift `validate()`: a
+    /// loopback listener behind `tailscale serve` is reachable by the tailnet.
+    pub(crate) fn new(
+        token: Option<String>,
+        allow_logins: Vec<String>,
+        insecure_local: bool,
+    ) -> Result<AuthPolicy, String> {
+        let allow_logins: Vec<String> = allow_logins.iter().map(|l| l.to_lowercase()).collect();
         if token.is_none() && allow_logins.is_empty() && !insecure_local {
             return Err(
                 "refusing to start with no auth: set MCP_TOKEN / MCP_TOKEN_FILE and/or \
@@ -61,41 +72,80 @@ impl AuthPolicy {
         )
     }
 
-    /// The authenticated principal matches the Swift AuthPolicy contract:
-    /// allowlisted Tailscale login, `token`, or debug-only `local`.
+    /// Adapter from a parsed request to [`AuthPolicy::decide`].
     pub(crate) fn check(&self, req: &HttpRequest) -> Result<String, String> {
+        match self.decide(
+            req.authorization.as_deref(),
+            req.ts_login.as_deref(),
+            req.forwarded_for.is_some(),
+            req.peer_is_loopback,
+        ) {
+            Decision::Allow(principal) => Ok(principal),
+            Decision::Deny(reason) => Err(reason),
+        }
+    }
+
+    /// The decision table, as a pure function. Same algorithm, order and reason
+    /// strings as Swift `AuthPolicy.decide(headers:remoteIsLoopback:)`, pinned by
+    /// `conformance/auth_vectors.json` (Swift is the oracle).
+    ///
+    /// - Bearer first: a wrong token is a deny even for an allow-listed login.
+    /// - The `Bearer` scheme is case-insensitive; the token is not.
+    /// - A request relayed by `tailscale serve` (it carries `Tailscale-User-Login`
+    ///   or `X-Forwarded-For`) is never "local", whatever its TCP peer is.
+    pub(crate) fn decide(
+        &self,
+        authorization: Option<&str>,
+        ts_login: Option<&str>,
+        forwarded: bool,
+        remote_is_loopback: bool,
+    ) -> Decision {
+        let login = ts_login.map(str::to_lowercase);
+        let via_tailscale = login.is_some() || forwarded;
+        let local_ok = remote_is_loopback && !via_tailscale && self.insecure_local;
+
         if let Some(expected) = &self.token {
-            let got = req
-                .authorization
-                .as_deref()
-                .and_then(|a| a.strip_prefix("Bearer "))
-                .unwrap_or("");
-            if !constant_time_eq(got.as_bytes(), expected.as_bytes()) {
-                return Err("bearer token missing or wrong".to_string());
+            let Some(auth) = authorization else {
+                return Decision::Deny("missing Authorization header".into());
+            };
+            const PREFIX: &str = "bearer ";
+            let scheme_ok = auth
+                .get(..PREFIX.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(PREFIX));
+            if !scheme_ok {
+                return Decision::Deny("Authorization must be Bearer".into());
+            }
+            if !constant_time_eq(&auth.as_bytes()[PREFIX.len()..], expected.as_bytes()) {
+                return Decision::Deny("bad token".into());
             }
         }
-        let login = req.ts_login.as_deref().map(|l| l.to_lowercase());
+
         if !self.allow_logins.is_empty() {
-            match login {
-                Some(ref l) if self.allow_logins.contains(l) => return Ok(l.clone()),
-                Some(l) => return Err(format!("login {l} not allowed")),
-                None if self.insecure_local && req.peer_is_loopback => {
-                    return Ok("local".to_string())
-                }
-                None => return Err("no Tailscale-User-Login header".to_string()),
-            }
+            return match login {
+                None if local_ok => Decision::Allow("local".into()),
+                None => Decision::Deny("no Tailscale identity on request".into()),
+                Some(l) if self.allow_logins.contains(&l) => Decision::Allow(l),
+                Some(l) => Decision::Deny(format!("login {l} not allowed")),
+            };
         }
-        if let Some(login) = login {
-            return Ok(login);
+
+        if let Some(l) = login {
+            return Decision::Allow(l);
         }
         if self.token.is_some() {
-            return Ok("token".to_string());
+            return Decision::Allow("token".into());
         }
-        if self.insecure_local && req.peer_is_loopback {
-            return Ok("local".to_string());
+        if local_ok {
+            return Decision::Allow("local".into());
         }
-        Err("unauthenticated".to_string())
+        Decision::Deny("unauthenticated".into())
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Decision {
+    Allow(String),
+    Deny(String),
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -109,4 +159,77 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod conformance {
+    //! `conformance/auth_vectors.json` — shared with the Swift test target; Swift
+    //! is the oracle. A case that fails here is a behaviour drift, not a test to
+    //! edit.
+    use super::*;
+    use serde_json::Value;
+
+    const VECTORS: &str = include_str!("../../../conformance/auth_vectors.json");
+
+    fn policy(config: &Value) -> Result<AuthPolicy, String> {
+        let logins = config["allowedLogins"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let token = config["bearerToken"].as_str().map(String::from);
+        let local = config["allowLocalUnauthenticated"]
+            .as_bool()
+            .unwrap_or(false);
+        AuthPolicy::new(token, logins, local)
+    }
+
+    #[test]
+    fn auth_policy_matches_the_swift_oracle_vectors() {
+        let doc: Value = serde_json::from_str(VECTORS).unwrap();
+        let cases = doc["cases"].as_array().unwrap();
+        assert!(cases.len() >= 16, "vector file shrank: {}", cases.len());
+        let mut failures = Vec::new();
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            if case["validate"].as_str() == Some("error") {
+                if policy(&case["config"]).is_ok() {
+                    failures.push(format!("{name}: validate should have failed"));
+                }
+                continue;
+            }
+            let policy = policy(&case["config"]).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let headers: std::collections::HashMap<String, String> = case["headers"]
+                .as_object()
+                .map(|h| {
+                    h.iter()
+                        .map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap_or("").to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let got = policy.decide(
+                headers.get("authorization").map(String::as_str),
+                headers.get("tailscale-user-login").map(String::as_str),
+                headers.contains_key("x-forwarded-for"),
+                case["remoteIsLoopback"].as_bool().unwrap_or(false),
+            );
+            let want = match (
+                case["expect"]["allow"].as_str(),
+                case["expect"]["deny"].as_str(),
+            ) {
+                (Some(p), _) => Decision::Allow(p.into()),
+                (_, Some(r)) => Decision::Deny(r.into()),
+                _ => panic!("{name}: vector has no expect"),
+            };
+            if got != want {
+                failures.push(format!("{name}: got {got:?}, want {want:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "drift from Swift oracle:\n{}",
+            failures.join("\n")
+        );
+    }
+}
