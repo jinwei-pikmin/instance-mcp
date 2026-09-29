@@ -14,5 +14,8 @@ mod platform;
 mod tools;
 
 fn main() {
+    // Input devices first, so clients see pointer/keyboard capabilities before any tool
+    // call (see platform/linux/seat.rs). Non-fatal: a node without a seat still serves bash.
+    platform::linux::seat::warm_up(platform::linux::wlroots::seat_command);
     http::serve();
 }

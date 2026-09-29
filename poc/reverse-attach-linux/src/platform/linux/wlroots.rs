@@ -1,11 +1,14 @@
-//! `Desktop` for wlroots compositors (labwc, sway, wayfire) via the seat's CLI tools:
-//! `grim` (wlr-screencopy), `wlrctl` (virtual-pointer) and `wtype` (virtual-keyboard).
+//! `Desktop` for wlroots compositors (labwc, sway, wayfire): `grim` (wlr-screencopy) for
+//! frames, a persistent virtual pointer (`seat.rs`, wlr virtual-pointer) for the mouse, and
+//! `wtype` (virtual-keyboard) behind a persistent keyboard anchor for keys. Transient
+//! `wlrctl`/`wtype` devices alone are dropped on a seat with no physical input — see seat.rs.
 //!
 //! Every helper is run with `WAYLAND_DISPLAY` / `XDG_RUNTIME_DIR` defaulted to the seat's
 //! usual values, because a systemd unit or an ssh-started daemon has neither.
 
 use std::process::Command;
 
+use super::seat;
 use crate::platform::desktop::{Button, Capture, Combo, Desktop, DesktopError};
 
 pub struct Wlroots;
@@ -14,7 +17,7 @@ extern "C" {
     fn getuid() -> u32;
 }
 
-fn seat_command(bin: &str) -> Command {
+pub(crate) fn seat_command(bin: &str) -> Command {
     let mut cmd = Command::new(bin);
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         cmd.env("WAYLAND_DISPLAY", "wayland-0");
@@ -60,17 +63,6 @@ fn grim_command(scale: f64, format: &str, quality: i64) -> Command {
     cmd
 }
 
-fn button_name(b: Button) -> &'static str {
-    match b {
-        Button::Left => "left",
-        Button::Right => "right",
-    }
-}
-
-fn i(v: f64) -> String {
-    format!("{}", v.round() as i64)
-}
-
 impl Desktop for Wlroots {
     fn display_ok(&self) -> bool {
         grim_command(0.05, "png", 80)
@@ -107,34 +99,33 @@ impl Desktop for Wlroots {
         })
     }
 
-    /// wlrctl only knows relative motion: pin to the top-left corner, then move by (x, y).
-    /// Correct on a single output; wrong with several.
+    /// Absolute motion over the whole output layout (screenshot pixels at scale 1).
     fn pointer_goto(&self, x: f64, y: f64) -> Result<(), DesktopError> {
-        run_seat("wlrctl", &sv(&["pointer", "move", "-20000", "-20000"]))?;
-        run_seat("wlrctl", &sv(&["pointer", "move", &i(x), &i(y)]))
+        seat::pointer_goto(x, y)
     }
 
     fn pointer_move_rel(&self, dx: f64, dy: f64) -> Result<(), DesktopError> {
-        run_seat("wlrctl", &sv(&["pointer", "move", &i(dx), &i(dy)]))
+        seat::pointer_move_rel(dx, dy)
     }
 
     fn pointer_click(&self, button: Button) -> Result<(), DesktopError> {
-        run_seat("wlrctl", &sv(&["pointer", "click", button_name(button)]))
+        seat::pointer_click(button)
     }
 
     fn pointer_press(&self, button: Button) -> Result<(), DesktopError> {
-        run_seat("wlrctl", &sv(&["pointer", "press", button_name(button)]))
+        seat::pointer_press(button)
     }
 
     fn pointer_release(&self, button: Button) -> Result<(), DesktopError> {
-        run_seat("wlrctl", &sv(&["pointer", "release", button_name(button)]))
+        seat::pointer_release(button)
     }
 
     fn pointer_scroll(&self, dx: f64, dy: f64) -> Result<(), DesktopError> {
-        run_seat("wlrctl", &sv(&["pointer", "scroll", &i(dy), &i(dx)]))
+        seat::pointer_scroll(dx, dy)
     }
 
     fn key_type(&self, text: &str) -> Result<(), DesktopError> {
+        seat::ensure_keyboard(seat_command)?;
         // `--` so text starting with '-' is not parsed as a flag.
         run_seat("wtype", &sv(&["--", text]))
     }
@@ -145,12 +136,19 @@ impl Desktop for Wlroots {
             args.push("-M".into());
             args.push(m.clone());
         }
+        if !combo.modifiers.is_empty() {
+            // wtype's own keyboard arrives with a fresh keymap; give the client a moment to
+            // apply it and the modifier state before the key, or shortcuts land as plain keys.
+            args.push("-s".into());
+            args.push("40".into());
+        }
         args.push("-k".into());
         args.push(combo.key.clone());
         for m in combo.modifiers.iter().rev() {
             args.push("-m".into());
             args.push(m.clone());
         }
+        seat::ensure_keyboard(seat_command)?;
         run_seat("wtype", &args)
     }
 }

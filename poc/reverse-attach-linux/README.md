@@ -69,7 +69,8 @@ desktop keeps a 1920×1080 headless output alive with no monitor attached, so no
 
 ## `mouse` / `key` (added 2026-09-28, #26)
 
-`mouse` → `wlrctl pointer` (move / click / double_click / right_click / drag / scroll, display
+`mouse` → a persistent wlroots virtual pointer held by the daemon (`src/platform/linux/seat.rs`;
+move / click / double_click / right_click / drag / scroll in wheel notches, display
 pixels = screenshot pixels at scale 1); `key` → `wtype` (`type` unicode text, `press` combos like
 `ctrl+shift+t`, `Return`, `Escape`; modifiers ctrl/shift/alt/super). Both run against the seat's
 `wayland-0`; labwc (wlroots) accepts the virtual-pointer and virtual-keyboard protocols with no
@@ -111,8 +112,6 @@ on rpi1's desktop, so `screenshot` / Connect's Screens pane show what the agent 
 - Screenshot is PNG only (≈2 MB per 1080p frame); Connect polls at ≤2 FPS, so expect ~4 MB/s. A
   JPEG encoder in-process (or a grim with libjpeg) is the fix.
 - `wss://` runtimes: dial works (rustls), mint over https does not.
-- `mouse` uses wlrctl's virtual pointer, which is relative-only: every absolute move is "pin to
-  (-20000,-20000), then move (x,y)"; fine on one output, wrong with multiple outputs.
 - Real-runtime test against the p1 openab-pty pod is pending: rpi1 is **not on the tailnet**
   (no `tailscale` binary; `100.111.174.31:8090` times out) and the pod's `PTY_ADMIN_HASH` is a
   hash, so the admin credential must come from the operator.

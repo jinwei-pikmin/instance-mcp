@@ -31,7 +31,7 @@ flowchart LR
         end
         subgraph hands["What the tools touch"]
             grim["grim → screenshot"]
-            wl["wlrctl / wtype → mouse, key"]
+            wl["virtual pointer / wtype → mouse, key"]
             sh["bash -c as the desktop user"]
         end
     end
@@ -50,7 +50,7 @@ terminates TLS and stamps the caller's Tailscale identity. Same shape as the Mac
 ## Prerequisites
 
 - A **wlroots compositor** as the seat (labwc, sway, wayfire): the daemon shells out to `grim`
-  (screenshot), `wlrctl` (pointer) and `wtype` (keyboard), which need the compositor's
+  (screenshot) and `wtype` (keyboard) and holds its own virtual pointer, which need the compositor's
   `wlr-screencopy`, `virtual-pointer` and `virtual-keyboard` protocols. GNOME/Mutter and KDE do
   not expose these. Two ways to have one:
   - a desktop already running on seat0 (Raspberry Pi OS labwc, a sway login) — see
@@ -340,8 +340,17 @@ What a box with no desktop needed beyond the Pi, all handled by `install-linux.s
   `/run/user/<uid>` when unset, the units set them explicitly, and `pw-mcp.sh` adds `DISPLAY`.
 - **`grim -t jpeg` → "jpeg support disabled"** on Debian's build. The daemon falls back to PNG
   for `jpeg` requests; Connect decodes by content and does not care.
-- **`wlrctl` is relative-only.** The daemon pins the pointer to (-20000,-20000) and moves by
-  (x, y) for absolute positioning; correct on one output, wrong with several.
+- **A seat with no physical input silently drops transient virtual devices.** Headless sway (black)
+  and a Pi with no mouse advertise no pointer/keyboard capability, so a `wlrctl`/`wtype` call that
+  creates a device, sends and exits within milliseconds is lost: Chromium never binds
+  `wl_pointer`/`wl_keyboard` in time, yet the tool exits 0 and `mouse`/`key` report `ok: true`.
+  The daemon therefore holds a **persistent** virtual pointer (its own Wayland connection, absolute
+  motion over the output layout) and a long-lived `wtype -s` keyboard anchor from startup; the
+  journal logs `seat: virtual pointer up` / `virtual keyboard anchor up`, and
+  `swaymsg -t get_seats` shows `capabilities 3`. `wtype -s` overflows a C `int` above ~35 min and
+  exits at once, so the anchor sleeps 30 min and is respawned.
+- **Chromium's `ctrl+l` focuses the omnibox but typed text may append** rather than replace; send
+  `ctrl+a` before typing a URL.
 - **Playwright `--allowed-hosts` needs the `host:port` form** or every request is 403.
 - **A stale upstream `Mcp-Session-Id` must be dropped before re-`initialize`**, or the upstream
   404s the initialize too and the browser tools never come back after a Playwright restart.

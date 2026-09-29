@@ -96,7 +96,7 @@ The URL is `https://<host>.<tailnet>.ts.net:8444/mcp` and the bearer token is in
 | | macOS | Linux |
 |---|---|---|
 | Implementation | Swift (Network.framework + ScreenCaptureKit) | Rust (`poc/reverse-attach-linux/`) |
-| Screen / input | ScreenCaptureKit · CGEvent, gated by TCC | grim · wlrctl · wtype on a wlroots seat (labwc, sway) |
+| Screen / input | ScreenCaptureKit · CGEvent, gated by TCC | grim · wlroots virtual pointer · wtype on a wlroots seat (labwc, sway) |
 | Shell | `exec` / `exec_start*` (`zsh -f`) | `bash` |
 | Apps | `osascript` / JXA | — (use `bash`: `gdbus`, `xdg-open`) |
 | Reverse attach · browser upstream | ✅ | ✅ |

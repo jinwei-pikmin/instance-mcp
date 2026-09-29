@@ -299,9 +299,10 @@ pub(crate) fn tool_list(profile: &str) -> Value {
 
     let mouse = json!({
         "name": "mouse",
-        "description": "Pointer input on this node's Wayland display via wlrctl. Coordinates are display \
-                        pixels = screenshot pixels at scale 1 (1920x1080 here). Actions: move, click, \
-                        double_click, right_click, drag (x,y → to_x,to_y), scroll (dy/dx, positive = down/right).",
+        "description": "Pointer input on this node's Wayland display (wlroots virtual pointer). Coordinates \
+                        are display pixels = screenshot pixels at scale 1 (1920x1080 here). Actions: move, \
+                        click, double_click, right_click, drag (x,y → to_x,to_y), scroll (dy/dx in wheel \
+                        notches/lines, positive = down/right).",
         "inputSchema": {
             "type": "object",
             "properties": {
