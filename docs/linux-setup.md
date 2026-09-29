@@ -287,8 +287,12 @@ sudo tailscale serve --https=8444 off               # stop exposing
 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u) wlr-randr    # outputs the tools see
 ```
 
-Restarting the daemon drops every grant (registry is in memory); the runtime notices the socket
-close and the agent's `instance_status` says nothing is attached until you `POST /attach` again.
+Grants survive a daemon restart (#12): live grants are kept in
+`~/.local/state/oab-instance-mcp/grants.json` (mode 600; override with `MCP_GRANTS_FILE`, or
+`MCP_GRANTS_FILE=off` to disable), and on start every grant still inside its deadline is re-dialled
+under its original id — `journalctl --user -u oab-instance-mcp` shows `grants: resuming <id>`. The
+file holds the attach secrets, at the same trust level as the bearer token file. A grant whose
+runtime has forgotten it (pod replaced) ends with `handshake_rejected_401`; lend again.
 
 ## Headless server notes (Ubuntu 24.04 on `black`)
 

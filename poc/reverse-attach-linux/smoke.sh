@@ -13,6 +13,9 @@ check(){ if eval "$2"; then ok "$1"; else bad "$1 :: $2"; fi; }
 
 pkill -x reverse-attach 2>/dev/null; pkill -f mock_runtime.py 2>/dev/null; sleep 0.3
 rm -f "$LOG" "$RA_LOG"
+# Never touch the real ~/.local/state grants file from a test run.
+GRANTS_DIR=$(mktemp -d)
+export MCP_GRANTS_FILE="$GRANTS_DIR/grants.json"
 
 # 1000 → redial, then 4010 → stop(revoked). Third attach (if any) would be 4010 again.
 PORT=18090 ADMIN=admin-secret CLOSES=1000,4010 SECRETS=pre=preminted-xyz LOG=$LOG \
@@ -21,7 +24,7 @@ MOCK=$!
 BIND=127.0.0.1:8790 MCP_INSECURE_LOCAL=1 MCP_UPSTREAM=browser=http://127.0.0.1:1/mcp $BIN > "$RA_LOG" 2>&1 &
 RA=$!
 sleep 0.5
-trap 'kill $MOCK $RA 2>/dev/null' EXIT
+trap 'kill $MOCK $RA 2>/dev/null; rm -rf "$GRANTS_DIR"' EXIT
 
 C="curl -s -m 5"
 state_of() { python3 -c 'import sys,json;print([g["state"] for g in json.load(sys.stdin)["grants"] if g["session"]==sys.argv[1]][0])' "$1"; }
@@ -128,6 +131,37 @@ r=$($C -X POST 127.0.0.1:8790/attach -d '{"runtime":"ws://127.0.0.1:1","session"
 sleep 5.5
 st=$($C 127.0.0.1:8790/attach)
 check "unreachable runtime ends at deadline" "[[ \$(echo '$st' | state_of dead) == ended && \$(echo '$st' | ended_of dead) == deadline ]]"
+
+
+echo "== grants survive a restart (#12) =="
+kill $RA $MOCK 2>/dev/null; wait $RA $MOCK 2>/dev/null
+rm -f "$MCP_GRANTS_FILE" "$LOG"
+# CLOSES=1000: the mock closes after each scripted turn and the node redials, so the
+# grant stays live and every (re)attach shows up as a new "attach" event.
+PORT=18090 ADMIN=admin-secret CLOSES=1000 SECRETS=keep=k1 LOG=$LOG \
+  python3 mock_runtime.py > /tmp/mock-runtime.out 2>&1 &
+MOCK=$!
+start_ra() { BIND=127.0.0.1:8790 MCP_INSECURE_LOCAL=1 $BIN >> "$RA_LOG" 2>&1 & RA=$!; sleep 0.5; }
+attaches() { grep -c '"ev": "attach", "session": "keep", "status": 101' $LOG 2>/dev/null || echo 0; }
+start_ra
+r=$($C -X POST 127.0.0.1:8790/attach -d '{"runtime":"ws://127.0.0.1:18090","session":"keep","profile":"sandbox","ttl_secs":120,"secret":"k1"}')
+GID=$(echo "$r" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+for i in $(seq 1 20); do [[ $(attaches) -ge 1 ]] && break; sleep 0.3; done
+check "grants file written with mode 600" "[[ \$(stat -c %a \"$MCP_GRANTS_FILE\" 2>/dev/null || stat -f %Lp \"$MCP_GRANTS_FILE\") == 600 ]]"
+check "grants file holds the grant" "grep -q \"$GID\" \"$MCP_GRANTS_FILE\""
+check "secret never appears in GET /attach" "! $C 127.0.0.1:8790/attach | grep -q k1"
+before=$(attaches)
+kill -9 $RA 2>/dev/null; wait $RA 2>/dev/null
+start_ra
+for i in $(seq 1 30); do [[ $(attaches) -gt $before ]] && break; sleep 0.3; done
+check "after kill -9 + restart the node redialled on its own" "[[ \$(attaches) -gt $before ]]"
+check "resumed under the same grant id" "$C 127.0.0.1:8790/attach | grep -q \"$GID\""
+check "restart logged the resume" "grep -q \"grants: resuming $GID\" $RA_LOG"
+$C -o /dev/null -X DELETE 127.0.0.1:8790/attach/$GID
+check "DELETE removes it from the file" "! grep -q \"$GID\" \"$MCP_GRANTS_FILE\""
+kill $RA 2>/dev/null; wait $RA 2>/dev/null
+start_ra
+check "a revoked grant is not resumed" "[[ \$($C 127.0.0.1:8790/attach | python3 -c 'import sys,json;print(len(json.load(sys.stdin)[\"grants\"]))') == 0 ]]"
 
 echo
 echo "reverse-attach stderr:"; sed 's/^/  /' $RA_LOG

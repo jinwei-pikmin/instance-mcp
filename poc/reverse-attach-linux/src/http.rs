@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::attach::client::{dial_loop, mint, DialGrant};
+use crate::attach::store;
 use crate::attach::{
     grant_json, new_grant_id, now_epoch_secs, valid_session, GrantInfo, Registry, GRANT_COUNTER,
 };
@@ -146,6 +147,10 @@ pub(crate) fn parse_mcp_body(body: &str) -> Result<Value, String> {
 pub fn serve() {
     let bind = std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8790".to_string());
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+    match store::init_from_env() {
+        Some(path) => eprintln!("grants: persisted at {}", path.display()),
+        None => eprintln!("grants: persistence off (MCP_GRANTS_FILE=off)"),
+    }
     let policy: Arc<AuthPolicy> = match AuthPolicy::from_env() {
         Ok(p) => Arc::new(p),
         Err(e) => {
@@ -170,6 +175,7 @@ pub fn serve() {
         }
     };
     eprintln!("reverse-attach control server listening on {bind}");
+    resume_grants(&registry);
 
     for stream in listener.incoming() {
         match stream {
@@ -374,6 +380,87 @@ fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &str)
     let _ = stream.flush();
 }
 
+/// Start the dial loop for one grant on its own thread.
+#[allow(clippy::too_many_arguments)]
+fn spawn_dial(
+    registry: &Registry,
+    grant_id: String,
+    runtime: String,
+    session: String,
+    profile: String,
+    secret: String,
+    deadline_epoch_secs: u64,
+    cancelled: Arc<AtomicBool>,
+) {
+    let registry = registry.clone();
+    thread::spawn(move || {
+        dial_loop(DialGrant {
+            runtime,
+            session,
+            secret,
+            profile,
+            deadline_epoch_secs,
+            registry,
+            grant_id,
+            cancelled,
+        });
+    });
+}
+
+/// Re-dial every persisted grant still inside its deadline, under its original
+/// id (#12). A runtime that has since forgotten the grant (pod replaced) answers
+/// the handshake with 401 and the grant ends through the normal disposition.
+fn resume_grants(registry: &Registry) {
+    let grants = store::load();
+    if grants.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = registry.lock() {
+        for g in &grants {
+            map.insert(
+                g.id.clone(),
+                GrantInfo {
+                    id: g.id.clone(),
+                    runtime: g.runtime.clone(),
+                    session: g.session.clone(),
+                    profile: g.profile.clone(),
+                    principal: g.principal.clone(),
+                    state: "idle".to_string(),
+                    ended: None,
+                    expires_at_epoch_secs: g.expires_at_epoch_secs,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    secret: g.secret.clone(),
+                },
+            );
+        }
+    }
+    for g in grants {
+        eprintln!(
+            "grants: resuming {} (session {}, {}s left)",
+            g.id,
+            g.session,
+            g.expires_at_epoch_secs.saturating_sub(now_epoch_secs())
+        );
+        let cancelled = registry
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&g.id).map(|x| x.cancelled.clone()))
+            .unwrap_or_default();
+        spawn_dial(
+            registry,
+            g.id,
+            g.runtime,
+            g.session,
+            g.profile,
+            g.secret,
+            g.expires_at_epoch_secs,
+            cancelled,
+        );
+    }
+    // Rewrite without whatever expired while we were down.
+    store::save(registry);
+}
+
 fn handle_conn(
     mut stream: TcpStream,
     registry: Registry,
@@ -544,28 +631,22 @@ fn handle_attach(
                 ended: None,
                 expires_at_epoch_secs: deadline,
                 cancelled: cancelled.clone(),
+                secret: effective_secret.clone(),
             },
         );
     }
+    store::save(&registry);
 
-    // Spawn the dial loop thread.
-    let reg = registry.clone();
-    let runtime_owned = runtime.to_string();
-    let session_owned = session.to_string();
-    let profile_owned = profile.clone();
-    let gid = grant_id.clone();
-    thread::spawn(move || {
-        dial_loop(DialGrant {
-            runtime: runtime_owned,
-            session: session_owned,
-            secret: effective_secret,
-            profile: profile_owned,
-            deadline_epoch_secs: deadline,
-            registry: reg,
-            grant_id: gid,
-            cancelled,
-        });
-    });
+    spawn_dial(
+        &registry,
+        grant_id.clone(),
+        runtime.to_string(),
+        session.to_string(),
+        profile.clone(),
+        effective_secret,
+        deadline,
+        cancelled,
+    );
 
     let response = {
         let map = registry
@@ -622,6 +703,7 @@ fn handle_delete_attachment(
     match removed {
         Some(grant) => {
             grant.cancelled.store(true, Ordering::Release);
+            store::save(&registry);
             write_raw(stream, 204, "No Content", "text/plain", b"", &[]);
         }
         None => write_response(stream, 404, "Not Found", "{\"error\":\"no such grant\"}"),

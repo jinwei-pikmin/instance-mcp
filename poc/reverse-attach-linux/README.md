@@ -106,6 +106,14 @@ next call re-initializes and still lists 37. Lent to `kiro-1040` session `mac` (
 `browser_snapshot` → `heading "Example Domain"`, `link "Learn more"`. The Chromium window is
 on rpi1's desktop, so `screenshot` / Connect's Screens pane show what the agent is doing.
 
+## Grant persistence (#12)
+
+Live grants are written to `MCP_GRANTS_FILE` (default `$XDG_STATE_HOME/oab-instance-mcp/grants.json`,
+`off` disables), mode 600 in a 0700 directory, replaced atomically on every create / replace /
+`DELETE` / terminal end. On start, grants still inside their deadline are re-dialled under the same
+id. Smoke covers `kill -9` → restart → redial, same id, secret absent from `GET /attach`, and a
+revoked grant not resumed.
+
 ## Not yet (vs the Swift implementation)
 
 - `/mcp` has no real session table (an `Mcp-Session-Id` is issued but not checked) and no SSE stream.

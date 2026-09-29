@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 pub mod client;
+pub mod store;
 
 // Shared grant registry
 // ---------------------------------------------------------------------------
@@ -23,6 +24,9 @@ pub(crate) struct GrantInfo {
     pub(crate) ended: Option<String>,
     pub(crate) expires_at_epoch_secs: u64,
     pub(crate) cancelled: Arc<AtomicBool>,
+    /// The attach secret this grant dials with. Held so the grant can be
+    /// persisted and resumed after a restart (#12); never in `grant_json`.
+    pub(crate) secret: String,
 }
 
 pub(crate) type Registry = Arc<Mutex<HashMap<String, GrantInfo>>>;
@@ -57,6 +61,8 @@ pub(crate) fn set_ended(registry: &Registry, grant_id: &str, reason: &str) {
             g.ended = Some(reason.to_string());
         }
     }
+    // A terminal grant must not be resumed after a restart.
+    store::save(registry);
 }
 
 /// Exact Swift `MacGrant` shape consumed by OpenAB Connect/Remote. Fields not
