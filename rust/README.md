@@ -60,6 +60,12 @@ It builds the release binary into `~/.local/bin`, creates `~/.config/oab-instanc
 `https://<node>.<tailnet>.ts.net:8444/mcp` with the Tailscale identity injected.
 `tailscale serve` needs operator rights once: `sudo tailscale set --operator=$USER`.
 
+It also publishes a tailnet-only **plain-HTTP twin** at `http://<node>.<tailnet>.ts.net:8080/mcp`
+(`--http-port 0` to skip). Same auth; the tailnet is WireGuard-encrypted. It exists for callers
+that reach the tailnet through an HTTP proxy — e.g. an agent on a PaaS (Zeabur, Fly, …) next to a
+userspace `tailscale` container with `--outbound-http-proxy-listen`: such a caller sets only
+`HTTP_PROXY`, so its `https://` traffic (LLM APIs, the web) stays direct.
+
 Caller config:
 
 ```sh
