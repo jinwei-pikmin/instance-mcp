@@ -112,6 +112,13 @@ only after a reimplementation reaches parity is strangler-fig migration.
   keeps the proven Swift core? Decide with Phase 0 + PoC evidence.
 - Concrete definition of "parity" before retiring Swift: a per-tool conformance checklist +
   the reverse-attach differential suite passing on both backends.
-- Wayland scope: wlroots-only, or add xdg-desktop-portal/PipeWire for GNOME/KDE?
-- Headless fleet: virtual compositor vs "graphical seat required" provisioning contract?
+- Wayland scope — **decided (2026-09-28, #23): wlroots-only for now.** grim/wlrctl/wtype on
+  labwc/sway cover the target fleet (Raspberry Pi OS labwc, headless sway). GNOME/KDE via
+  xdg-desktop-portal is a later second `Desktop` impl behind the trait from #33, not a blocker;
+  an independent portal backend already exists (see #32).
+- Headless fleet — **decided (2026-09-28, #23): virtual compositor supported.**
+  `install-linux.sh --headless-seat` runs sway with the headless wlroots backend as a user unit
+  (one 1920×1080 output, pixman, no GPU/monitor) — the provisioning story; verified on a fresh
+  Ubuntu 24.04 server with no desktop (`black`, #34). Boxes that already run a wlroots desktop
+  (Raspberry Pi OS) need nothing extra.
 - macOS release: cross-compile feasibility + CI runners for signing/notarization from Rust.
