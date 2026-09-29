@@ -4,7 +4,7 @@ import CoreGraphics
 import Foundation
 import InstanceMCPCore
 
-let version = "0.6.5"
+let version = "0.6.6"
 
 struct Options {
     var host = "127.0.0.1"

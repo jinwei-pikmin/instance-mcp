@@ -82,7 +82,7 @@ deleted in an `always()` cleanup step.
    ```
 
 4. The `Release macOS installer` workflow builds/tests, signs, notarizes and publishes the macOS
-   artifacts, and (since 0.6.5) `oab-instance-mcp-VERSION-linux-{arm64,amd64}.tar.gz` + `.sha256`
+   artifacts, and (since 0.6.6) `oab-instance-mcp-VERSION-linux-{arm64,amd64}.tar.gz` + `.sha256`
    from the same run. All three jobs wait on the `release` environment approval. A manual
    dispatch can retry an existing tag; it is not a way to release an untagged commit, and it
    **must run on the tag ref** — the environment only allows `v*` refs, so a dispatch from
@@ -129,8 +129,8 @@ lipo -create /tmp/imcp-arm64/release/oab-instance-mcp \
              /tmp/imcp-x86_64/release/oab-instance-mcp \
              -output /tmp/oab-instance-mcp
 chmod +x /tmp/oab-instance-mcp
-scripts/assemble-app.sh /tmp/oab-instance-mcp /tmp/oab-instance-mcp.app 0.6.5
-ALLOW_UNSIGNED=1 scripts/package-pkg.sh /tmp/oab-instance-mcp.app /tmp/oab-instance-mcp.pkg 0.6.5
+scripts/assemble-app.sh /tmp/oab-instance-mcp /tmp/oab-instance-mcp.app 0.6.6
+ALLOW_UNSIGNED=1 scripts/package-pkg.sh /tmp/oab-instance-mcp.app /tmp/oab-instance-mcp.pkg 0.6.6
 ```
 
 Unsigned artifacts are testing inputs only; do not install or publish them.
