@@ -291,7 +291,15 @@ fn mint_at_runtime() -> MintFn {
                 &format!("/admin/sessions/{session}/tools-attach"),
             );
             let body = serde_json::json!({ "ttl_secs": ttl.as_secs() }).to_string();
-            let fut = http_post(&url, &credential, https, body);
+            let headers = [
+                ("authorization", format!("Bearer {credential}")),
+                ("content-type", "application/json".to_string()),
+            ];
+            let fut = async {
+                crate::net::post(&url, &headers, body)
+                    .await
+                    .map(|r| (r.status, r.body))
+            };
             let (status, body) = tokio::time::timeout(Duration::from_secs(15), fut)
                 .await
                 .map_err(|_| transport("timed out".into()))?
@@ -320,75 +328,6 @@ fn mint_at_runtime() -> MintFn {
             }
         })
     })
-}
-
-/// Minimal one-shot HTTP/1.1 POST of a JSON body over plain TCP or rustls.
-async fn http_post(
-    url: &str,
-    bearer: &str,
-    https: bool,
-    json: String,
-) -> Result<(u16, Vec<u8>), String> {
-    use http_body_util::{BodyExt, Full};
-    use hyper::body::Bytes;
-    use hyper_util::rt::TokioIo;
-
-    let uri: Uri = url.parse().map_err(|e| format!("bad url: {e}"))?;
-    let host = uri.host().ok_or("no host")?.to_string();
-    let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-    let req = hyper::Request::post(uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"))
-        .header("host", uri.authority().map(|a| a.as_str()).unwrap_or(&host))
-        .header("authorization", format!("Bearer {bearer}"))
-        .header("content-type", "application/json")
-        .header("content-length", json.len().to_string())
-        .body(Full::new(Bytes::from(json)))
-        .map_err(|e| e.to_string())?;
-
-    let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
-        .await
-        .map_err(|e| e.to_string())?;
-
-    async fn send<S>(io: S, req: hyper::Request<Full<Bytes>>) -> Result<(u16, Vec<u8>), String>
-    where
-        S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-    {
-        let (mut tx, conn) = hyper::client::conn::http1::handshake(io)
-            .await
-            .map_err(|e| e.to_string())?;
-        tokio::spawn(conn);
-        let resp = tx.send_request(req).await.map_err(|e| e.to_string())?;
-        let status = resp.status().as_u16();
-        let body = resp
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| e.to_string())?
-            .to_bytes();
-        Ok((status, body.to_vec()))
-    }
-
-    if https {
-        use tokio_rustls::rustls;
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let name =
-            rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| e.to_string())?;
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
-            .connect(name, tcp)
-            .await
-            .map_err(|e| e.to_string())?;
-        send(TokioIo::new(tls), req).await
-    } else {
-        send(TokioIo::new(tcp), req).await
-    }
 }
 
 #[cfg(test)]

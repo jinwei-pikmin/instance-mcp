@@ -1,0 +1,17 @@
+[Unit]
+Description=Playwright MCP for oab-instance-mcp (headed browser, loopback only)
+Documentation=https://github.com/openabdev/instance-mcp/tree/main/poc/pw-mcp
+# In the desktop session, so the browser is a real window the human can watch.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Rendered by install.sh from `command -v node`: nvm/asdf installs are not on systemd's PATH.
+Environment=PATH=@NODE_DIR@:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/share/oab-instance-mcp/pw-mcp.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

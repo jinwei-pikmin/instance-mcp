@@ -13,12 +13,14 @@ build, so callers (kiro-cli, claude, openab) configure it exactly like the Mac o
 | `screenshot` / `mouse` / `key` | ✅ | ✅ xdg-desktop-portal (GNOME verified; KDE should work, untested); same schema and point coordinates. wlroots (grim/ydotool) not yet |
 | `osascript` | ✅ | — no Linux equivalent; use `exec` (`gdbus`, `xdg-open`) |
 | Reverse attach (`POST/GET /attach`, `DELETE /attach/{id}`, `--no-attach`) | ✅ | ✅ same grant API, close-code policy and backoff; replies are sent concurrently by JSON-RPC id |
-| `--upstream` (re-serve Playwright MCP as `browser_*`) | ✅ | ⏳ |
+| `--upstream` (re-serve Playwright MCP as `browser_*`) | ✅ | ✅ same merge / profile filter / session re-init; `install.sh` sets up Playwright MCP when Node.js is present |
 
 Reverse attach: a human `POST /attach {runtime, session, profile, ttl_secs, secret | admin_credential}`
 with the same credential as `/mcp`; this machine dials `{runtime}/tools/attach/{session}` over
 `ws://` or `wss://` (rustls, webpki roots) and serves MCP on that socket scoped to the profile.
-Under `sandbox` there is no `exec*`; a lent sandbox gets `sys_info`, `screenshot`, `mouse`, `key`.
+Under `sandbox` there is no `exec*`; a lent sandbox gets `sys_info`, `screenshot`, `mouse`, `key`
+and the allowlisted `browser_*` subset (navigate / read / interact — no `browser_run_code_unsafe`,
+file upload, PDF, network inspection, dialogs or `browser_close`).
 
 Desktop (portal backend), verified on GNOME 50 Wayland at 5/3 fractional scaling:
 
@@ -36,6 +38,15 @@ Desktop (portal backend), verified on GNOME 50 Wayland at 5/3 fractional scaling
 - **Shortcuts** use ctrl; `cmd` is accepted as an alias for ctrl.
 - `--no-desktop` turns the three tools off; they are off automatically without a graphical session.
 - The service runs with `KillMode=process`, so apps opened via `exec` survive restarts.
+
+Browser (`--upstream browser=http://127.0.0.1:8794/mcp`): `install.sh` installs
+`@playwright/mcp` (pinned 0.0.82, as the Swift build) under `~/.local/share/oab-instance-mcp/pw-mcp`
+and runs it as the systemd user service `oab-pw-mcp` on loopback only — no auth of its own; the
+daemon's auth and profiles front it. The browser is **headed** (a real window on the desktop) with
+its own persistent profile, never the user's; it uses the system Google Chrome when present,
+otherwise Playwright's Chromium. The daemon re-serves its 32 tools, local names win on collision,
+an upstream that is down simply contributes nothing, and a lost upstream session is re-initialized
+once. `--no-browser` skips it.
 
 Job logs: `$XDG_STATE_HOME/oab-instance-mcp/jobs/<job_id>.out|.err` (default `~/.local/state/…`).
 

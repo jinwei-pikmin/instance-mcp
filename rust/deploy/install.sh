@@ -3,9 +3,12 @@
 # publish it on the tailnet with `tailscale serve` (TLS + Tailscale-User-Login injection).
 #
 #   rust/deploy/install.sh [--allow-login you@example.com] [--https-port 8444] [--http-port 8080|0]
+#                          [--no-browser]
 #
 # Re-runnable: keeps an existing token, rebuilds and restarts the service.
 # --http-port 0 skips the tailnet-only plain-HTTP entry.
+# With Node.js available it also installs the Playwright MCP (headed browser, loopback only)
+# and re-serves its browser_* tools through the daemon; --no-browser skips that.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -14,12 +17,15 @@ allow_login=""
 https_port=8444
 http_port=8080
 local_port=8795
+browser=auto
+pw_version=0.0.82   # pinned, same as the Swift build's poc/pw-mcp
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --allow-login) allow_login="$2"; shift 2 ;;
     --https-port) https_port="$2"; shift 2 ;;
     --http-port) http_port="$2"; shift 2 ;;
+    --no-browser) browser=no; shift ;;
     *) echo "unknown flag $1" >&2; exit 64 ;;
   esac
 done
@@ -42,10 +48,33 @@ if [[ ! -s "$token_file" ]]; then
 fi
 chmod 600 "$token_file"
 
-echo "==> installing systemd user service"
 unit_dir="$HOME/.config/systemd/user"
 install -d "$unit_dir"
-sed "s|@ALLOW_LOGIN@|$allow_login|" "$here/oab-instance-mcp.service" > "$unit_dir/oab-instance-mcp.service"
+extra_args=""
+if [[ "$browser" == auto ]] && command -v node >/dev/null && command -v npm >/dev/null; then
+  echo "==> Playwright MCP (browser_* tools) on 127.0.0.1:8794"
+  data="${XDG_DATA_HOME:-$HOME/.local/share}/oab-instance-mcp"
+  install -d "$data/pw-mcp"
+  (cd "$data/pw-mcp" && { [[ -f package.json ]] || npm init -y >/dev/null; } \
+    && npm install --save-exact --no-fund --no-audit "@playwright/mcp@$pw_version" >/dev/null)
+  if [[ ! -x /opt/google/chrome/chrome ]]; then
+    echo "   no Google Chrome: fetching Playwright's Chromium (~150 MB, once)"
+    (cd "$data/pw-mcp" && npx --yes playwright install chromium)
+  fi
+  install -m755 "$here/pw-mcp.sh" "$data/pw-mcp.sh"
+  # nvm/asdf node is not on systemd's PATH: bake its directory into the unit.
+  sed "s|@NODE_DIR@|$(dirname "$(command -v node)")|" "$here/oab-pw-mcp.service" > "$unit_dir/oab-pw-mcp.service"
+  systemctl --user daemon-reload
+  systemctl --user enable oab-pw-mcp.service >/dev/null
+  systemctl --user restart oab-pw-mcp.service
+  extra_args="--upstream browser=http://127.0.0.1:8794/mcp"
+elif [[ "$browser" == auto ]]; then
+  echo "==> no Node.js: skipping the browser (install node and re-run for browser_* tools)"
+fi
+
+echo "==> installing systemd user service"
+sed -e "s|@ALLOW_LOGIN@|$allow_login|" -e "s|@EXTRA_ARGS@|$extra_args|" \
+  "$here/oab-instance-mcp.service" > "$unit_dir/oab-instance-mcp.service"
 systemctl --user daemon-reload
 systemctl --user enable oab-instance-mcp.service >/dev/null
 systemctl --user restart oab-instance-mcp.service

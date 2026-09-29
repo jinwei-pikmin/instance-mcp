@@ -7,7 +7,7 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/oab-instance-mcp --host 127.0.0.1 --port 8795 --allow-login @ALLOW_LOGIN@ --token-file %h/.config/oab-instance-mcp/token
+ExecStart=%h/.local/bin/oab-instance-mcp --host 127.0.0.1 --port 8795 --allow-login @ALLOW_LOGIN@ --token-file %h/.config/oab-instance-mcp/token @EXTRA_ARGS@
 Restart=on-failure
 # Apps started through `exec` (a browser, an editor) belong to the user's desktop, not to
 # this daemon: a restart or upgrade must not kill them.

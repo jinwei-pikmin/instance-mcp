@@ -5,8 +5,10 @@ mod attach;
 mod auth;
 mod http;
 mod mcp;
+mod net;
 mod platform;
 mod tools;
+mod upstream;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -48,6 +50,8 @@ struct Options {
     log_requests: bool,
     attach: bool,
     desktop: bool,
+    /// name=url pairs; each a loopback MCP server whose tools are re-served here.
+    upstreams: Vec<(String, String)>,
 }
 
 fn usage() -> ! {
@@ -72,7 +76,12 @@ Auth (at least one required unless --insecure-local):
   --no-desktop    Do not offer screenshot / mouse / key even inside a desktop session.
                   (They are offered automatically when the process sees a graphical session.)
 
-Not yet in the Rust build: --upstream, --menu-bar.
+  --upstream <name=url>  Re-serve the tools of a loopback MCP server (e.g. the Playwright MCP
+                  at browser=http://127.0.0.1:8794/mcp) under this daemon, subject to the
+                  connection's tool profile. Repeatable. Tools keep the upstream's own names;
+                  sandbox sees an allowlisted subset of browser_*.
+
+Not yet in the Rust build: --menu-bar.
 
 Run it as a systemd *user* service in the logged-in user's session, bound to loopback,
 behind `tailscale serve` (see rust/deploy/).",
@@ -94,6 +103,7 @@ fn parse_args() -> Options {
         log_requests: false,
         attach: true,
         desktop: true,
+        upstreams: vec![],
     };
     let mut args = std::env::args().skip(1);
     let next = |flag: &str, args: &mut dyn Iterator<Item = String>| {
@@ -120,7 +130,19 @@ fn parse_args() -> Options {
             "--log-requests" => o.log_requests = true,
             "--no-attach" => o.attach = false,
             "--no-desktop" => o.desktop = false,
-            "--upstream" | "--menu-bar" | "--public-url" => {
+            "--upstream" => {
+                let v = next(&a, &mut args);
+                match v.split_once('=') {
+                    Some((name, url)) if !name.is_empty() && url.starts_with("http") => {
+                        o.upstreams.push((name.into(), url.into()))
+                    }
+                    _ => {
+                        eprintln!("--upstream wants name=http://host:port/path");
+                        usage()
+                    }
+                }
+            }
+            "--menu-bar" | "--public-url" => {
                 eprintln!("{a} is not supported by the Rust build yet");
                 std::process::exit(64)
             }
@@ -155,7 +177,7 @@ fn parse_args() -> Options {
     o
 }
 
-fn instructions(desktop: bool) -> String {
+fn instructions(desktop: bool, browser: bool) -> String {
     let mut s = format!(
         "You are operating a real {os} machine ({host}) as its logged-in user; a human may be using it. \
          `exec` is a plain `{shell} -c` shell as that user and is the right tool for files and commands; \
@@ -174,6 +196,15 @@ fn instructions(desktop: bool) -> String {
              `scale: 2`; the crop's pixel (px,py) is point (region.x + px/2, region.y + py/2). Shortcuts \
              use ctrl on Linux. The first desktop call may wait for a human to approve remote control \
              on this machine's screen.",
+        );
+    }
+    if browser {
+        s.push_str(
+            " A browser is available through the `browser_*` tools (Playwright, a real window on this \
+             machine's desktop): prefer `browser_navigate` + `browser_snapshot` (accessibility tree as \
+             text) to read a page, and `browser_click` / `browser_type` / `browser_fill_form` to act — \
+             they are exact and need no screenshots. Fall back to `screenshot` only for things outside \
+             the browser.",
         );
     }
     s
@@ -220,12 +251,24 @@ async fn main() {
         tools.push(Arc::new(MouseTool(d.clone())));
         tools.push(Arc::new(KeyTool(d.clone())));
     }
+    let upstreams: Vec<Arc<upstream::Upstream>> = opts
+        .upstreams
+        .iter()
+        .map(|(name, url)| match upstream::Upstream::new(name, url) {
+            Ok(u) => Arc::new(u),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(64)
+            }
+        })
+        .collect();
     let server = McpServer::new(
         "oab-instance-mcp",
         VERSION,
-        Some(instructions(desktop.is_some())),
+        Some(instructions(desktop.is_some(), !upstreams.is_empty())),
         tools,
-    );
+    )
+    .with_upstreams(upstreams);
     let tool_list = server.tool_names().join(",");
     let attach = opts
         .attach
@@ -247,13 +290,14 @@ async fn main() {
         }
     };
     log(&format!(
-        "oab-instance-mcp {VERSION} (rust/{}) starting on http://{addr}{} auth=[logins:{} token:{} insecure-local:{}] attach={} tools=[{tool_list}]",
+        "oab-instance-mcp {VERSION} (rust/{}) starting on http://{addr}{} auth=[logins:{} token:{} insecure-local:{}] attach={} tools=[{tool_list}] upstreams=[{}]",
         std::env::consts::OS,
         opts.path,
         opts.allow_logins.join(","),
         opts.token.is_some(),
         opts.insecure_local,
         opts.attach,
+        opts.upstreams.iter().map(|(n, u)| format!("{n}={u}")).collect::<Vec<_>>().join(","),
     ));
 
     let app = http::router(endpoint).into_make_service_with_connect_info::<SocketAddr>();

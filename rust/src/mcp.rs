@@ -271,6 +271,13 @@ pub struct McpServer {
     pub instructions: Option<String>,
     tools: Vec<Arc<dyn Tool>>,
     by_name: HashMap<&'static str, Arc<dyn Tool>>,
+    /// Loopback MCP servers whose tools are merged into `tools/list` (after the local ones)
+    /// and routed on `tools/call`. Resolved per request, so a down upstream just contributes
+    /// nothing.
+    upstreams: Vec<Arc<crate::upstream::Upstream>>,
+    /// Applied to upstream tool names at list and call time (their lists are dynamic, so the
+    /// profile has to travel with the server). None ⇒ everything.
+    upstream_filter: Option<ToolProfile>,
 }
 
 impl McpServer {
@@ -292,7 +299,32 @@ impl McpServer {
             instructions,
             tools,
             by_name,
+            upstreams: vec![],
+            upstream_filter: None,
         }
+    }
+
+    pub fn with_upstreams(mut self, upstreams: Vec<Arc<crate::upstream::Upstream>>) -> Self {
+        self.upstreams = upstreams;
+        self
+    }
+
+    /// Upstream tools visible here: allowed by the profile, and not shadowing a local tool
+    /// (an upstream cannot replace `screenshot`). Paired with the upstream that serves them.
+    async fn upstream_tools(&self) -> Vec<(Value, Arc<crate::upstream::Upstream>)> {
+        let mut out = vec![];
+        for u in &self.upstreams {
+            for t in u.tools().await {
+                let Some(name) = t.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let allowed = self.upstream_filter.is_none_or(|p| p.allows(name));
+                if allowed && !self.by_name.contains_key(name) {
+                    out.push((t.clone(), u.clone()));
+                }
+            }
+        }
+        out
     }
 
     pub fn tool_names(&self) -> Vec<&'static str> {
@@ -311,7 +343,10 @@ impl McpServer {
             .cloned()
             .collect();
         let instructions = instructions.or_else(|| self.instructions.clone());
-        Self::new(&self.name, &self.version, instructions, tools)
+        let mut scoped = Self::new(&self.name, &self.version, instructions, tools);
+        scoped.upstreams = self.upstreams.clone();
+        scoped.upstream_filter = Some(profile);
+        scoped
     }
 
     /// Returns None for notifications (no response body) — the HTTP layer answers 202.
@@ -347,18 +382,28 @@ impl McpServer {
             }
             "ping" => Ok(json!({})),
             "tools/list" => {
-                Ok(json!({"tools": self.tools.iter().map(|t| t.descriptor()).collect::<Vec<_>>()}))
+                let mut list: Vec<Value> = self.tools.iter().map(|t| t.descriptor()).collect();
+                list.extend(self.upstream_tools().await.into_iter().map(|(d, _)| d));
+                Ok(json!({ "tools": list }))
             }
             "tools/call" => {
                 let name = param("name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::invalid_params("missing tool name"))?;
-                let tool = self
-                    .by_name
-                    .get(name)
-                    .ok_or_else(|| RpcError::invalid_params(format!("unknown tool: {name}")))?;
                 let empty = json!({});
                 let args = param("arguments").unwrap_or(&empty);
+                let Some(tool) = self.by_name.get(name) else {
+                    // Not local: an upstream tool this profile may see, or unknown — the same
+                    // error either way, so a caller cannot probe for tools it was not given.
+                    let found = self
+                        .upstream_tools()
+                        .await
+                        .into_iter()
+                        .find(|(d, _)| d["name"] == name);
+                    let (_, upstream) = found
+                        .ok_or_else(|| RpcError::invalid_params(format!("unknown tool: {name}")))?;
+                    return upstream.call(name, args).await;
+                };
                 match tool.call(args).await {
                     Ok(r) => Ok(r.json()),
                     Err(ToolFail::Rpc(e)) => Err(e),
