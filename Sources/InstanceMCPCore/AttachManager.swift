@@ -54,15 +54,46 @@ public actor AttachManager {
     private let log: @Sendable (String) -> Void
     private var grants: [String: Grant] = [:]
     private var clients: [String: ReverseAttachClient] = [:]
+    /// Attach secrets by grant id, held only so live grants can be persisted (#12).
+    private var secrets: [String: String] = [:]
+    /// nil ⇒ grants live in memory only (tests, `--no-grant-persistence`).
+    private let store: GrantStore?
     /// Seam for tests: mint against the runtime's admin plane.
     private let mint: @Sendable (URL, String, String, TimeInterval) async throws -> (secret: String, expiresIn: TimeInterval)
 
     public init(server: MCPServer,
                 mint: (@Sendable (URL, String, String, TimeInterval) async throws -> (secret: String, expiresIn: TimeInterval))? = nil,
+                store: GrantStore? = nil,
                 log: @escaping @Sendable (String) -> Void = { _ in }) {
         self.baseServer = server
         self.log = log
         self.mint = mint ?? AttachManager.mintAtRuntime
+        self.store = store
+    }
+
+    /// Re-dial every persisted grant still inside its deadline, under its original
+    /// id. Call once at start. A runtime that has forgotten the grant (pod replaced)
+    /// answers the handshake with 401 and the grant ends through the normal
+    /// disposition. Returns how many were resumed.
+    @discardableResult
+    public func resume() async -> Int {
+        guard let store else { return 0 }
+        let persisted = store.load()
+        var resumed = 0
+        for p in persisted where grants[p.id] == nil {
+            guard let profile = ToolProfile(rawValue: p.profile) else {
+                log("grant \(p.id.prefix(8)) has unknown profile \(p.profile); dropping it")
+                continue
+            }
+            let grant = Grant(id: p.id, runtime: p.runtime, session: p.session, profile: profile,
+                              principal: p.principal, createdAt: p.createdAt, expiresAt: p.expiresAt, state: .idle)
+            log("grant \(p.id.prefix(8)) resumed: \(profile.rawValue) → \(p.runtime.host ?? "?")/\(p.session), \(Int(p.expiresAt.timeIntervalSinceNow))s left")
+            await startClient(grant, secret: p.secret)
+            resumed += 1
+        }
+        // Rewrite without whatever expired or failed to load while we were down.
+        persist()
+        return resumed
     }
 
     // MARK: API
@@ -115,41 +146,76 @@ public actor AttachManager {
         }
 
         let id = UUID().uuidString.lowercased()
-        var grant = Grant(id: id, runtime: req.runtime, session: req.session, profile: req.profile,
+        let grant = Grant(id: id, runtime: req.runtime, session: req.session, profile: req.profile,
                           principal: principal, createdAt: Date(), expiresAt: expiresAt, state: .idle)
-        let instructions = Self.sandboxInstructions(profile: req.profile, base: baseServer.instructions)
-        let scoped = baseServer.scoped(to: req.profile, instructions: instructions)
-        let config = ReverseAttachClient.Config(runtime: req.runtime, session: req.session, secret: secret,
-                                                profile: req.profile, deadline: expiresAt)
+        log("grant \(id.prefix(8)) by \(principal): \(req.profile.rawValue) → \(req.runtime.host ?? "?")/\(req.session) for \(Int(req.ttl))s")
+        let started = await startClient(grant, secret: secret)
+        persist()
+        return started
+    }
+
+    /// Register `grant` and start dialling. Shared by `create` and `resume`.
+    @discardableResult
+    private func startClient(_ grant: Grant, secret: String) async -> Grant {
+        let id = grant.id
+        let instructions = Self.sandboxInstructions(profile: grant.profile, base: baseServer.instructions)
+        let scoped = baseServer.scoped(to: grant.profile, instructions: instructions)
+        let config = ReverseAttachClient.Config(runtime: grant.runtime, session: grant.session, secret: secret,
+                                                profile: grant.profile, deadline: grant.expiresAt)
         let client = ReverseAttachClient(
             config: config, server: scoped,
             onStateChange: { [weak self] s in Task { await self?.update(id, state: s) } },
             log: log)
         grants[id] = grant
         clients[id] = client
-        log("grant \(id.prefix(8)) by \(principal): \(req.profile.rawValue) → \(req.runtime.host ?? "?")/\(req.session) for \(Int(req.ttl))s")
+        secrets[id] = secret
         await client.start()
-        grant.state = await client.state
-        return grant
+        var started = grant
+        started.state = await client.state
+        return started
     }
 
     public func revoke(_ id: String, reason: String = "revoked") async {
         guard let g = grants.removeValue(forKey: id) else { return }
+        secrets.removeValue(forKey: id)
         if let c = clients.removeValue(forKey: id) { await c.cancel() }
         log("grant \(id.prefix(8)) \(reason) (\(g.session))")
+        persist()
     }
 
     /// Drop grants whose client has reached a terminal state or whose deadline
     /// passed. Called from the HTTP layer opportunistically; nothing depends on it.
     public func sweep() async {
+        var changed = false
         for (id, g) in grants {
-            if case .ended = g.state { grants.removeValue(forKey: id); clients.removeValue(forKey: id); continue }
+            if case .ended = g.state {
+                grants.removeValue(forKey: id); clients.removeValue(forKey: id); secrets.removeValue(forKey: id)
+                changed = true
+                continue
+            }
             if g.expiresAt < Date() { await revoke(id, reason: "expired") }
         }
+        if changed { persist() }
     }
 
     private func update(_ id: String, state: ReverseAttachClient.State) {
         grants[id]?.state = state
+        // A terminal grant must not be resumed after a restart.
+        if case .ended = state { persist() }
+    }
+
+    /// Write the live grants (not ended, not expired) to the store, if any.
+    private func persist() {
+        guard let store else { return }
+        let now = Date()
+        let live: [PersistedGrant] = grants.values.compactMap { g in
+            if case .ended = g.state { return nil }
+            guard g.expiresAt > now, let secret = secrets[g.id] else { return nil }
+            return PersistedGrant(id: g.id, runtime: g.runtime, session: g.session, profile: g.profile.rawValue,
+                                  principal: g.principal, createdAt: g.createdAt, expiresAt: g.expiresAt,
+                                  secret: secret)
+        }
+        store.save(live.sorted { $0.createdAt < $1.createdAt })
     }
 
     // MARK: helpers
