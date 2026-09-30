@@ -463,3 +463,70 @@ mod tests {
         );
     }
 }
+
+/// The shared Swift/Rust vectors (`conformance/reverse_attach_vectors.json`, Swift is the oracle).
+#[cfg(test)]
+mod conformance {
+    use super::*;
+
+    fn swift_name(t: Terminal) -> &'static str {
+        match t {
+            Terminal::GrantExpired => "grantExpired",
+            Terminal::Replaced => "replaced",
+            Terminal::SessionEnded => "sessionEnded",
+            Terminal::Revoked => "revoked",
+            _ => "other",
+        }
+    }
+
+    #[test]
+    fn reverse_attach_vectors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../conformance/reverse_attach_vectors.json"
+        );
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        for c in v["close_code"].as_array().unwrap() {
+            let code = c["code"].as_u64().unwrap() as u16;
+            match (disposition_for_close(code), c["expect"]["stop"].as_str()) {
+                (Disposition::Stop(t), Some(want)) => {
+                    assert_eq!(swift_name(t), want, "close {code}")
+                }
+                (Disposition::Redial, None) => {
+                    assert_eq!(c["expect"]["redial"], true, "close {code}")
+                }
+                (got, _) => panic!("close {code}: got {got:?}, want {}", c["expect"]),
+            }
+        }
+        for c in v["handshake_status"].as_array().unwrap() {
+            let status = c["status"].as_u64().unwrap() as u16;
+            match (
+                disposition_for_handshake(status),
+                c["expect"]["stop_rejected"].as_u64(),
+            ) {
+                (Disposition::Stop(Terminal::HandshakeRejected(s)), Some(want)) => {
+                    assert_eq!(u64::from(s), want, "status {status}")
+                }
+                (Disposition::Redial, None) => {
+                    assert_eq!(c["expect"]["redial"], true, "status {status}")
+                }
+                (got, _) => panic!("status {status}: got {got:?}, want {}", c["expect"]),
+            }
+        }
+        for c in v["attach_url"].as_array().unwrap() {
+            let cfg = Config::new(
+                c["runtime"].as_str().unwrap().parse().unwrap(),
+                c["session"].as_str().unwrap().into(),
+                "s".into(),
+                ToolProfile::Sandbox,
+                Instant::now(),
+            );
+            assert_eq!(
+                cfg.attach_url(),
+                c["expect"].as_str().unwrap(),
+                "{}",
+                c["runtime"]
+            );
+        }
+    }
+}

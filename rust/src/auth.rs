@@ -308,3 +308,62 @@ mod tests {
         ));
     }
 }
+
+/// The shared Swift/Rust vectors (`conformance/auth_vectors.json`, Swift is the oracle).
+#[cfg(test)]
+mod conformance {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn auth_vectors() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../conformance/auth_vectors.json"
+        );
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let cases = v["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for c in cases {
+            let name = c["name"].as_str().unwrap();
+            let cfg = &c["config"];
+            let logins = cfg["allowedLogins"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|l| l.as_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let p = AuthPolicy::new(
+                logins,
+                cfg["bearerToken"].as_str().map(String::from),
+                cfg["allowLocalUnauthenticated"].as_bool().unwrap_or(false),
+            );
+            if let Some(want) = c["validate"].as_str() {
+                assert_eq!(p.validate().is_err(), want == "error", "{name}");
+                continue;
+            }
+            let headers: HashMap<String, String> = c["headers"]
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap().to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let got = p.decide(&headers, c["remoteIsLoopback"].as_bool().unwrap());
+            let want = match (c["expect"]["allow"].as_str(), c["expect"]["deny"].as_str()) {
+                (Some(principal), None) => Decision::Allow {
+                    principal: principal.into(),
+                    profile: ToolProfile::Owner,
+                },
+                (None, Some(reason)) => Decision::Deny {
+                    reason: reason.into(),
+                },
+                _ => panic!("{name}: bad expect"),
+            };
+            assert_eq!(got, want, "vector: {name}");
+        }
+    }
+}
