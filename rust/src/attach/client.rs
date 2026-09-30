@@ -179,14 +179,31 @@ fn set_state(state: &Mutex<State>, s: State) {
 
 /// `server` should already be scoped to `config.profile`; this does not re-scope, so a
 /// caller can pass a pre-built, instruction-tailored server.
+#[cfg(test)]
 pub fn start(config: Config, server: McpServer) -> ClientHandle {
+    start_with_hook(config, server, None)
+}
+
+/// As `start`, calling `on_exit` once the dial loop has finished for good — the grant ended
+/// (terminal close code, rejected handshake, deadline) or was cancelled. The manager uses it
+/// to drop the grant from its persisted set.
+pub fn start_with_hook(
+    config: Config,
+    server: McpServer,
+    on_exit: Option<Box<dyn FnOnce() + Send>>,
+) -> ClientHandle {
     let state = Arc::new(Mutex::new(State::Idle));
     let (cancel, cancel_rx) = watch::channel(false);
     let handle = ClientHandle {
         state: state.clone(),
         cancel,
     };
-    tokio::spawn(run(config, Arc::new(server), state, cancel_rx));
+    tokio::spawn(async move {
+        run(config, Arc::new(server), state, cancel_rx).await;
+        if let Some(f) = on_exit {
+            f();
+        }
+    });
     handle
 }
 
@@ -331,6 +348,9 @@ async fn dial_once(
                 Some(Ok(Message::Close(frame))) => {
                     let code = frame.map(|f| u16::from(f.code)).unwrap_or(1005);
                     log(&format!("attach {}: closed {code} after {served} calls", cfg.session));
+                    // tungstenite queued the echoing Close frame when it read theirs; flush it
+                    // so the runtime sees a clean close handshake, not a bare EOF.
+                    let _ = sink.close().await;
                     break disposition_for_close(code);
                 }
                 // Pings are answered by tungstenite on the next write/flush.

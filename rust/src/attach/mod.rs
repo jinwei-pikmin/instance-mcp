@@ -9,6 +9,7 @@
 //! grant record or logged.
 
 pub mod client;
+pub mod store;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -78,7 +79,15 @@ struct Grant {
     principal: String,
     created_at: SystemTime,
     expires_at: SystemTime,
+    /// Kept only to persist the grant; never part of `json()`.
+    secret: String,
     client: ClientHandle,
+}
+
+fn unix(t: SystemTime) -> u64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn iso(t: SystemTime) -> String {
@@ -122,15 +131,140 @@ pub struct AttachManager {
     base: McpServer,
     grants: Mutex<HashMap<String, Grant>>,
     mint: MintFn,
+    /// None ⇒ grants live in memory only (tests, `--no-grant-persistence`).
+    store: Option<store::Store>,
+    /// Resolves custom profile names when resuming persisted grants.
+    access: Option<Arc<crate::access::Access>>,
+    me: std::sync::Weak<AttachManager>,
 }
 
 impl AttachManager {
+    /// In memory only.
+    #[cfg(test)]
     pub fn new(base: McpServer, mint: Option<MintFn>) -> Arc<Self> {
-        Arc::new(Self {
+        Self::with_store(base, mint, None, None)
+    }
+
+    pub fn with_store(
+        base: McpServer,
+        mint: Option<MintFn>,
+        store: Option<store::Store>,
+        access: Option<Arc<crate::access::Access>>,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
             base,
             grants: Mutex::new(HashMap::new()),
             mint: mint.unwrap_or_else(mint_at_runtime),
+            store,
+            access,
+            me: me.clone(),
         })
+    }
+
+    /// Write the live grants (not ended, not expired) to the store, if there is one.
+    fn persist(&self) {
+        let Some(store) = &self.store else { return };
+        let now = SystemTime::now();
+        let live: Vec<store::Persisted> = {
+            let grants = self.grants.lock().unwrap();
+            let mut v: Vec<&Grant> = grants
+                .values()
+                .filter(|g| g.expires_at > now && !matches!(g.client.state(), State::Ended(_)))
+                .collect();
+            v.sort_by_key(|g| g.created_at);
+            v.into_iter()
+                .map(|g| store::Persisted {
+                    id: g.id.clone(),
+                    runtime: g.runtime.to_string(),
+                    session: g.session.clone(),
+                    profile: g.profile.name().to_string(),
+                    principal: g.principal.clone(),
+                    created_at: unix(g.created_at),
+                    expires_at: unix(g.expires_at),
+                    secret: g.secret.clone(),
+                })
+                .collect()
+        };
+        store.save(&live);
+    }
+
+    /// Start the dial loop for a grant; when it finishes for good, re-persist so an ended
+    /// grant is not resumed after a restart.
+    fn start_client(&self, cfg: Config, scoped: McpServer) -> ClientHandle {
+        let me = self.me.clone();
+        client::start_with_hook(
+            cfg,
+            scoped,
+            Some(Box::new(move || {
+                if let Some(m) = me.upgrade() {
+                    m.persist();
+                }
+            })),
+        )
+    }
+
+    /// Re-dial every persisted grant still inside its deadline, under its original id.
+    /// Call once at start. A runtime that has forgotten the grant (pod replaced) answers the
+    /// handshake with 401 and the grant ends through the normal disposition. Returns how many
+    /// were resumed.
+    pub fn resume(&self) -> usize {
+        let Some(store) = &self.store else { return 0 };
+        let now = SystemTime::now();
+        let mut resumed = 0;
+        for p in store.load() {
+            let expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(p.expires_at);
+            let Some(left) = expires_at.duration_since(now).ok().filter(|d| !d.is_zero()) else {
+                continue; // expired while we were down
+            };
+            let profile = match &self.access {
+                Some(a) => a.profile(&p.profile),
+                None => ToolProfile::built_in(&p.profile),
+            };
+            let (Some(profile), Ok(runtime)) = (profile, p.runtime.parse::<Uri>()) else {
+                log(&format!(
+                    "grant {} not resumed: profile '{}' is not defined (or bad runtime)",
+                    &p.id[..8.min(p.id.len())],
+                    p.profile
+                ));
+                continue;
+            };
+            if self.grants.lock().unwrap().contains_key(&p.id) {
+                continue;
+            }
+            let instructions = sandbox_instructions(&profile, self.base.instructions.as_deref());
+            let scoped = self.base.scoped(profile.clone(), instructions);
+            let cfg = Config::new(
+                runtime.clone(),
+                p.session.clone(),
+                p.secret.clone(),
+                profile.clone(),
+                Instant::now() + left,
+            );
+            log(&format!(
+                "grant {} resumed: {} → {}/{} for {}s more",
+                &p.id[..8.min(p.id.len())],
+                profile.name(),
+                runtime.host().unwrap_or("?"),
+                p.session,
+                left.as_secs()
+            ));
+            let grant = Grant {
+                id: p.id.clone(),
+                runtime,
+                session: p.session,
+                profile,
+                principal: p.principal,
+                created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(p.created_at),
+                expires_at,
+                secret: p.secret,
+                client: self.start_client(cfg, scoped),
+            };
+            self.grants.lock().unwrap().insert(p.id, grant);
+            resumed += 1;
+        }
+        // Rewrite without the expired / unresumable ones.
+        self.persist();
+        resumed
     }
 
     pub fn list(&self) -> Vec<Value> {
@@ -185,7 +319,7 @@ impl AttachManager {
         let cfg = Config::new(
             runtime.clone(),
             req.session.clone(),
-            secret,
+            secret.clone(),
             req.profile.clone(),
             Instant::now() + ttl,
         );
@@ -216,16 +350,23 @@ impl AttachManager {
             principal: principal.into(),
             created_at: now,
             expires_at: now + ttl,
-            client: client::start(cfg, scoped),
+            secret,
+            client: self.start_client(cfg, scoped),
         };
         let out = grant.json();
         grants.insert(id, grant);
+        drop(grants);
+        self.persist();
         Ok(out)
     }
 
     /// Returns false if there was no such grant.
     pub fn revoke(&self, id: &str) -> bool {
-        Self::revoke_locked(&mut self.grants.lock().unwrap(), id, "revoked")
+        let removed = Self::revoke_locked(&mut self.grants.lock().unwrap(), id, "revoked");
+        if removed {
+            self.persist();
+        }
+        removed
     }
 
     fn revoke_locked(grants: &mut HashMap<String, Grant>, id: &str, reason: &str) -> bool {
@@ -251,10 +392,16 @@ impl AttachManager {
             .filter(|g| g.expires_at < now)
             .map(|g| g.id.clone())
             .collect();
+        let before = grants.len();
         for id in expired {
             Self::revoke_locked(&mut grants, &id, "expired");
         }
         grants.retain(|_, g| !matches!(g.client.state(), State::Ended(_)));
+        let changed = grants.len() != before;
+        drop(grants);
+        if changed {
+            self.persist();
+        }
     }
 }
 

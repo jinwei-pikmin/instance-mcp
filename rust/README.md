@@ -13,7 +13,12 @@ build, so callers (kiro-cli, claude, openab) configure it exactly like the Mac o
 | `screenshot` / `mouse` / `key` | ✅ | ✅ xdg-desktop-portal (GNOME verified; KDE should work, untested); same schema and point coordinates. wlroots (grim/ydotool) not yet |
 | `osascript` | ✅ | — no Linux equivalent; use `exec` (`gdbus`, `xdg-open`) |
 | Reverse attach (`POST/GET /attach`, `DELETE /attach/{id}`, `--no-attach`) | ✅ | ✅ same grant API, close-code policy and backoff; replies are sent concurrently by JSON-RPC id |
+| Reverse-attach grants survive a restart (`grants.json`, `--no-grant-persistence`) | ✅ (#43, secret in Keychain) | ✅ same resume-under-original-id; secret in the 0600 file, as the upstream Linux PoC (#42) |
 | `--upstream` (re-serve Playwright MCP as `browser_*`) | ✅ | ✅ same merge / profile filter / session re-init; `install.sh` sets up Playwright MCP when Node.js is present |
+
+Live grants are saved to `$XDG_STATE_HOME/oab-instance-mcp/grants.json` (0600 in a 0700 dir,
+atomic) on create / replace / revoke / sweep / end, and re-dialled under their original id after a
+restart until they expire; `--no-grant-persistence` keeps them in memory only.
 
 Reverse attach: a human `POST /attach {runtime, session, profile, ttl_secs, secret | admin_credential}`
 with the same credential as `/mcp`; this machine dials `{runtime}/tools/attach/{session}` over

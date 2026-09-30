@@ -50,6 +50,7 @@ struct Options {
     quiet: bool,
     log_requests: bool,
     attach: bool,
+    grant_persistence: bool,
     desktop: bool,
     /// name=url pairs; each a loopback MCP server whose tools are re-served here.
     upstreams: Vec<(String, String)>,
@@ -63,7 +64,8 @@ USAGE: oab-instance-mcp token add <name> --profile <profile> | token list | toke
        oab-instance-mcp profile list
        oab-instance-mcp [--host 127.0.0.1] [--port 8795] [--path /mcp]
                         [--allow-login <email>]... [--token <str> | --token-file <path>]
-                        [--insecure-local] [--quiet] [--log-requests] [--no-attach] [--no-desktop]
+                        [--insecure-local] [--quiet] [--log-requests] [--no-attach] [--no-grant-persistence]
+                        [--no-desktop]
 
 Auth (at least one required unless --insecure-local):
   --allow-login   Tailscale login (from `tailscale serve`'s Tailscale-User-Login header). Repeatable.
@@ -75,6 +77,10 @@ Auth (at least one required unless --insecure-local):
   --no-attach     Disable the reverse-attach plane (POST/GET /attach, DELETE /attach/{{id}}):
                   the human-credentialed endpoint through which Connect / Remote lends this
                   machine to one openab-pty session (this machine dials the pod).
+
+  --no-grant-persistence  Keep reverse-attach grants in memory only. By default live grants
+                  (with their attach secrets) are saved to $XDG_STATE_HOME/oab-instance-mcp/
+                  grants.json (0600) and re-dialled after a restart until they expire.
 
   --no-desktop    Do not offer screenshot / mouse / key even inside a desktop session.
                   (They are offered automatically when the process sees a graphical session.)
@@ -118,6 +124,7 @@ fn parse_args() -> Options {
         quiet: false,
         log_requests: false,
         attach: true,
+        grant_persistence: true,
         desktop: true,
         upstreams: vec![],
     };
@@ -145,6 +152,7 @@ fn parse_args() -> Options {
             "--quiet" => o.quiet = true,
             "--log-requests" => o.log_requests = true,
             "--no-attach" => o.attach = false,
+            "--no-grant-persistence" => o.grant_persistence = false,
             "--no-desktop" => o.desktop = false,
             "--upstream" => {
                 let v = next(&a, &mut args);
@@ -235,12 +243,13 @@ async fn main() {
     let _ = LOG_REQUESTS.set(opts.log_requests);
 
     let config_dir = platform::backend().config_dir();
+    let access = access::Access::new(&config_dir);
     let auth = AuthPolicy::new(
         opts.allow_logins.clone(),
         opts.token.clone(),
         opts.insecure_local,
     )
-    .with_access(access::Access::new(&config_dir));
+    .with_access(access.clone());
     if let Err(e) = auth.validate() {
         eprintln!("{e}");
         std::process::exit(64)
@@ -288,9 +297,21 @@ async fn main() {
     )
     .with_upstreams(upstreams);
     let tool_list = server.tool_names().join(",");
-    let attach = opts
-        .attach
-        .then(|| attach::AttachManager::new(server.clone(), None));
+    let attach = opts.attach.then(|| {
+        // Live grants survive a restart unless --no-grant-persistence (Swift #43, PoC #42).
+        let store = opts.grant_persistence.then(|| {
+            let state = platform::backend().job_log_dir();
+            let dir = state.parent().unwrap_or(&state).to_path_buf();
+            attach::store::Store::new(dir.join("grants.json"))
+        });
+        let mgr =
+            attach::AttachManager::with_store(server.clone(), None, store, Some(access.clone()));
+        let n = mgr.resume();
+        if n > 0 {
+            log(&format!("resumed {n} reverse-attach grant(s)"));
+        }
+        mgr
+    });
     let endpoint = http::Endpoint::new(opts.path.clone(), server, auth, attach);
 
     let addr: SocketAddr = match format!("{}:{}", opts.host, opts.port).parse() {

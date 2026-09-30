@@ -713,3 +713,152 @@ async fn a_named_token_gets_its_profile_and_cannot_use_attach() {
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert!(e["error"].as_str().unwrap().contains("browser"), "{e}");
 }
+
+// MARK: - grant persistence (Swift #43 / PoC #42)
+
+fn persistent(dir: &std::path::Path) -> Arc<AttachManager> {
+    AttachManager::with_store(
+        full_server(),
+        None,
+        Some(super::store::Store::new(dir.join("state/grants.json"))),
+        Some(crate::access::Access::new(dir)),
+    )
+}
+
+fn stored(dir: &std::path::Path) -> Vec<super::store::Persisted> {
+    super::store::Store::new(dir.join("state/grants.json")).load()
+}
+
+fn lend(runtime: String, secret: &str, ttl: i64) -> AttachRequest {
+    AttachRequest {
+        runtime,
+        session: "laptop".into(),
+        profile: ToolProfile::Sandbox,
+        ttl_secs: ttl,
+        secret: Some(secret.into()),
+        admin_credential: None,
+    }
+}
+
+#[tokio::test]
+async fn live_grants_are_saved_privately_and_dropped_on_revoke() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let m = persistent(dir.path());
+    let g = m
+        .create(lend("ws://127.0.0.1:9".into(), "s3cret-on-disk", 60), "a@b")
+        .await
+        .unwrap();
+    let id = g["id"].as_str().unwrap().to_string();
+    assert!(
+        !g.to_string().contains("s3cret-on-disk"),
+        "the API never returns the secret"
+    );
+
+    let saved = stored(dir.path());
+    assert_eq!(saved.len(), 1);
+    assert_eq!(
+        (
+            saved[0].id.as_str(),
+            saved[0].secret.as_str(),
+            saved[0].profile.as_str()
+        ),
+        (id.as_str(), "s3cret-on-disk", "sandbox")
+    );
+    let mode = |p: &str| {
+        std::fs::metadata(dir.path().join(p))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!((mode("state/grants.json"), mode("state")), (0o600, 0o700));
+
+    assert!(m.revoke(&id));
+    assert!(
+        stored(dir.path()).is_empty(),
+        "a revoked grant is not resumed"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_redials_under_the_same_id_with_the_saved_secret() {
+    // 4006 = runtime replaced: the grant stays live and keeps redialling.
+    let rt = FakeRuntime::start("s3", 4006).await;
+    let dir = tempfile::tempdir().unwrap();
+    let id = {
+        let before = persistent(dir.path());
+        let g = before
+            .create(lend(rt.url().to_string(), "s3", 60), "a@b")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        g["id"].as_str().unwrap().to_string()
+        // `before` is dropped here: the daemon "stops" without revoking anything.
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(stored(dir.path()).len(), 1, "a stop is not a revoke");
+    let dials_before = rt.upgrades();
+
+    let after = persistent(dir.path());
+    assert_eq!(after.resume(), 1);
+    let g = after.get(&id).expect("same id after restart");
+    assert_eq!(
+        (g["profile"].as_str(), g["principal"].as_str()),
+        (Some("sandbox"), Some("a@b"))
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // FakeRuntime answers 401 to a wrong secret; a new upgrade means the saved one was used.
+    assert!(
+        rt.upgrades() > dials_before,
+        "resumed grant dialled the runtime again"
+    );
+    assert!(after.get(&id).unwrap()["state"] != "ended");
+}
+
+#[tokio::test]
+async fn expired_and_unresolvable_grants_are_not_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let rec = |id: &str, profile: &str, expires_at: u64| super::store::Persisted {
+        id: id.into(),
+        runtime: "ws://127.0.0.1:9".into(),
+        session: "laptop".into(),
+        profile: profile.into(),
+        principal: "a@b".into(),
+        created_at: now - 10,
+        expires_at,
+        secret: "s".into(),
+    };
+    super::store::Store::new(dir.path().join("state/grants.json")).save(&[
+        rec("expired-0000", "sandbox", now - 1),
+        rec("gone-profile", "nope", now + 600),
+        rec("live-0000000", "owner", now + 600),
+    ]);
+    let m = persistent(dir.path());
+    assert_eq!(m.resume(), 1);
+    assert!(m.get("live-0000000").is_some());
+    assert!(m.get("expired-0000").is_none() && m.get("gone-profile").is_none());
+    let left: Vec<String> = stored(dir.path()).into_iter().map(|p| p.id).collect();
+    assert_eq!(left, ["live-0000000"], "the file is rewritten without them");
+}
+
+#[tokio::test]
+async fn a_grant_the_runtime_revoked_leaves_the_file() {
+    let rt = FakeRuntime::start("s3", 4010).await;
+    let dir = tempfile::tempdir().unwrap();
+    let m = persistent(dir.path());
+    m.create(lend(rt.url().to_string(), "s3", 60), "a@b")
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if stored(dir.path()).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("an ended grant must not stay persisted");
+}
