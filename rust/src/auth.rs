@@ -4,8 +4,17 @@
 //! plus an optional shared bearer token. Both checks that are configured must pass. With
 //! neither configured the server refuses to start — see `validate()` — because a loopback
 //! listener behind `tailscale serve` is reachable by every node on the tailnet.
+//!
+//! Beyond the Swift table: when a bearer token is configured, a presented token that is not
+//! it may instead be one of the operator's **named tokens** (`access`), which carries its
+//! own tool profile. The main token is `owner`. The login check still applies to both, so a
+//! named token never replaces the Tailscale identity, it only narrows what the caller gets.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::access::{Access, TokenMatch};
+use crate::mcp::ToolProfile;
 
 #[derive(Debug, Clone, Default)]
 pub struct AuthPolicy {
@@ -15,12 +24,20 @@ pub struct AuthPolicy {
     pub bearer_token: Option<String>,
     /// Requests from loopback *without* Tailscale headers are allowed only if set.
     pub allow_local_unauthenticated: bool,
+    /// Named tokens with their own profiles. Consulted only when `bearer_token` is set.
+    pub access: Option<Arc<Access>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
-    Allow { principal: String },
-    Deny { reason: String },
+    /// `principal` names the caller for logs — the login, plus `[token]` for a named token.
+    Allow {
+        principal: String,
+        profile: ToolProfile,
+    },
+    Deny {
+        reason: String,
+    },
 }
 
 impl AuthPolicy {
@@ -33,7 +50,13 @@ impl AuthPolicy {
             allowed_logins: logins.into_iter().map(|l| l.to_lowercase()).collect(),
             bearer_token: token,
             allow_local_unauthenticated: insecure_local,
+            access: None,
         }
+    }
+
+    pub fn with_access(mut self, access: Arc<Access>) -> Self {
+        self.access = Some(access);
+        self
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -61,6 +84,7 @@ impl AuthPolicy {
             .map(|l| l.to_lowercase());
         let via_tailscale = login.is_some() || headers.contains_key("x-forwarded-for");
         let local_ok = remote_is_loopback && !via_tailscale && self.allow_local_unauthenticated;
+        let mut named_token: Option<(String, ToolProfile)> = None;
 
         // Bearer check first: a wrong token is a deny even for an allowlisted login.
         if let Some(expected) = &self.bearer_token {
@@ -73,17 +97,40 @@ impl AuthPolicy {
             if auth.len() < PREFIX.len() || !auth[..PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
                 return deny("Authorization must be Bearer");
             }
-            if !constant_time_eq(&auth[PREFIX.len()..], expected.as_bytes()) {
-                return deny("bad token");
+            let presented = &auth[PREFIX.len()..];
+            if !constant_time_eq(presented, expected.as_bytes()) {
+                let named = std::str::from_utf8(presented)
+                    .ok()
+                    .and_then(|t| self.access.as_ref()?.match_token(t));
+                match named {
+                    Some(TokenMatch::Profile { token, profile: p }) => {
+                        named_token = Some((token, p))
+                    }
+                    Some(TokenMatch::UndefinedProfile { token, profile }) => {
+                        return Decision::Deny {
+                            reason: format!("token '{token}' names undefined profile '{profile}'"),
+                        };
+                    }
+                    None => return deny("bad token"),
+                }
             }
         }
+        // Every allow below carries the profile: owner, or the named token's.
+        let allow = |principal: String| match &named_token {
+            Some((token, profile)) => Decision::Allow {
+                principal: format!("{principal} [{token}]"),
+                profile: profile.clone(),
+            },
+            None => Decision::Allow {
+                principal,
+                profile: ToolProfile::Owner,
+            },
+        };
 
         if !self.allowed_logins.is_empty() {
             let Some(login) = login else {
                 if local_ok {
-                    return Decision::Allow {
-                        principal: "local".into(),
-                    };
+                    return allow("local".into());
                 }
                 return deny("no Tailscale identity on request");
             };
@@ -92,21 +139,17 @@ impl AuthPolicy {
                     reason: format!("login {login} not allowed"),
                 };
             }
-            return Decision::Allow { principal: login };
+            return allow(login);
         }
 
         if let Some(login) = login {
-            return Decision::Allow { principal: login };
+            return allow(login);
         }
         if self.bearer_token.is_some() {
-            return Decision::Allow {
-                principal: "token".into(),
-            };
+            return allow("token".into());
         }
         if local_ok {
-            return Decision::Allow {
-                principal: "local".into(),
-            };
+            return allow("local".into());
         }
         deny("unauthenticated")
     }
@@ -132,7 +175,58 @@ mod tests {
     fn allow(p: &str) -> Decision {
         Decision::Allow {
             principal: p.into(),
+            profile: ToolProfile::Owner,
         }
+    }
+
+    #[test]
+    fn named_tokens_carry_their_profile_and_still_need_the_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |name: &str, token: &str, profile: &str| {
+            format!(
+                "[tokens.{name}]\nprofile = \"{profile}\"\nsha256 = \"{}\"\ncreated = \"t\"\n",
+                crate::access::sha256_hex(token)
+            )
+        };
+        std::fs::write(
+            dir.path().join("tokens.toml"),
+            entry("hermes", "oabt_h", "sandbox") + &entry("ghost", "oabt_g", "nope"),
+        )
+        .unwrap();
+        let p = AuthPolicy::new(["me@x.io".into()], Some("main".into()), false)
+            .with_access(Access::new(dir.path()));
+        let req = |tok: &str, login: &str| {
+            h(&[
+                ("authorization", &format!("Bearer {tok}")),
+                ("tailscale-user-login", login),
+            ])
+        };
+        assert_eq!(p.decide(&req("main", "me@x.io"), true), allow("me@x.io"));
+        assert_eq!(
+            p.decide(&req("oabt_h", "me@x.io"), true),
+            Decision::Allow {
+                principal: "me@x.io [hermes]".into(),
+                profile: ToolProfile::Sandbox
+            }
+        );
+        // The login check still applies to a named token.
+        assert!(matches!(
+            p.decide(&req("oabt_h", "you@x.io"), true),
+            Decision::Deny { .. }
+        ));
+        // A token naming a profile that does not exist is denied, never widened.
+        assert_eq!(
+            p.decide(&req("oabt_g", "me@x.io"), true),
+            Decision::Deny {
+                reason: "token 'ghost' names undefined profile 'nope'".into()
+            }
+        );
+        assert_eq!(
+            p.decide(&req("oabt_zzz", "me@x.io"), true),
+            Decision::Deny {
+                reason: "bad token".into()
+            }
+        );
     }
 
     #[test]

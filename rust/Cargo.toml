@@ -24,6 +24,8 @@ webpki-roots = "1"
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 base64 = "0.23.1"
+toml = "1.1.6"
+ring = { version = "0.17", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -48,6 +48,24 @@ otherwise Playwright's Chromium. The daemon re-serves its 32 tools, local names 
 an upstream that is down simply contributes nothing, and a lost upstream session is re-initialized
 once. `--no-browser` skips it.
 
+Named tokens and custom profiles — give each caller only what it needs (operator-managed;
+a client never picks its own profile):
+
+```sh
+cp ~/.config/oab-instance-mcp/profiles.example.toml ~/.config/oab-instance-mcp/profiles.toml
+oab-instance-mcp profile list                      # owner, sandbox + yours (risky tools flagged)
+oab-instance-mcp token add hermes --profile browser  # prints the token once; stores its SHA-256
+oab-instance-mcp token list
+oab-instance-mcp token revoke hermes               # effective on the next request, no restart
+```
+
+A named token is sent as the caller's Bearer instead of the main token; the Tailscale login
+check still applies. Profiles: `allow` / `deny` glob patterns, deny wins, anything not allowed
+is denied (including tools an upstream adds later). A narrowed caller gets a scoped server —
+omitted tools are absent from `tools/list` and "unknown" on `tools/call`, and `sys_info` reports
+the narrowed list. `/attach` accepts the owner token only; it can lend with a custom profile by
+name. Both files are re-read on change; a broken file is rejected and the previous version stays.
+
 Job logs: `$XDG_STATE_HOME/oab-instance-mcp/jobs/<job_id>.out|.err` (default `~/.local/state/…`).
 
 ## Build and test

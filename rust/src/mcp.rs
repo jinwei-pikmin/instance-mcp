@@ -203,14 +203,46 @@ pub trait Tool: Send + Sync {
     }
 }
 
-/// Which tools a connection may see and call. `owner` is the logged-in human's own CLI:
-/// everything. `sandbox` is an agent in an `openab-pty` session this machine was lent to:
-/// no `exec*` (the agent already has a shell in its sandbox) and an allowlisted
-/// `browser_*` subset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which tools a connection may see and call. Built in: `owner` — the machine owner's own
+/// clients, everything; `sandbox` — an agent in an `openab-pty` session this machine was lent
+/// to: no `exec*` (it has a shell of its own) and an allowlisted `browser_*` subset. Custom
+/// profiles come from the operator's `profiles.toml` (see `access`): allow/deny patterns,
+/// deny wins, anything not allowed is denied — including tools an upstream adds later.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ToolProfile {
     Owner,
     Sandbox,
+    Custom(Arc<CustomProfile>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomProfile {
+    pub name: String,
+    pub allow: Vec<String>,
+    pub deny: Vec<String>,
+}
+
+/// `*` matches any run of characters (including none); everything else is literal.
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    let (mut pi, mut ti, mut star, mut mark) = (0, 0, None, 0);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == b'*')
 }
 
 impl ToolProfile {
@@ -233,20 +265,30 @@ impl ToolProfile {
         "browser_evaluate",
     ];
 
-    pub const ALL: [ToolProfile; 2] = [ToolProfile::Owner, ToolProfile::Sandbox];
+    /// Names no profiles.toml entry may take.
+    pub const BUILT_IN: [&'static str; 2] = ["owner", "sandbox"];
 
-    pub fn as_str(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             ToolProfile::Owner => "owner",
             ToolProfile::Sandbox => "sandbox",
+            ToolProfile::Custom(c) => &c.name,
         }
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.as_str() == s)
+    pub fn built_in(name: &str) -> Option<Self> {
+        match name {
+            "owner" => Some(ToolProfile::Owner),
+            "sandbox" => Some(ToolProfile::Sandbox),
+            _ => None,
+        }
     }
 
-    pub fn allows(self, tool: &str) -> bool {
+    pub fn is_owner(&self) -> bool {
+        matches!(self, ToolProfile::Owner)
+    }
+
+    pub fn allows(&self, tool: &str) -> bool {
         match self {
             ToolProfile::Owner => true,
             ToolProfile::Sandbox => {
@@ -257,6 +299,10 @@ impl ToolProfile {
                     return Self::SANDBOX_BROWSER_TOOLS.contains(&tool);
                 }
                 true
+            }
+            ToolProfile::Custom(c) => {
+                !c.deny.iter().any(|p| glob_match(p, tool))
+                    && c.allow.iter().any(|p| glob_match(p, tool))
             }
         }
     }
@@ -318,7 +364,7 @@ impl McpServer {
                 let Some(name) = t.get("name").and_then(Value::as_str) else {
                     continue;
                 };
-                let allowed = self.upstream_filter.is_none_or(|p| p.allows(name));
+                let allowed = self.upstream_filter.as_ref().is_none_or(|p| p.allows(name));
                 if allowed && !self.by_name.contains_key(name) {
                     out.push((t.clone(), u.clone()));
                 }

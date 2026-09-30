@@ -142,13 +142,25 @@ async fn handle(
             log(&format!("deny {method} {path} from {from}: {reason}"));
             return text(StatusCode::UNAUTHORIZED, "unauthorized\n");
         }
-        Decision::Allow { principal } => principal,
+        Decision::Allow { principal, profile } => (principal, profile),
     };
+    let (principal, profile) = principal;
 
     if is_attach {
-        // Same AuthPolicy as /mcp: the human's credential, never the sandbox's.
+        // Same AuthPolicy as /mcp, and the owner's credential only: a narrowed token must
+        // not be able to lend this machine to anyone (with any profile it likes).
+        if !profile.is_owner() {
+            log(&format!(
+                "deny {method} {path} for {principal}: /attach needs the owner profile"
+            ));
+            return text(
+                StatusCode::FORBIDDEN,
+                "forbidden: /attach needs the owner token\n",
+            );
+        }
         return attach_route(
             ep.attach.as_ref().unwrap(),
+            ep.auth.access.as_deref(),
             &method,
             path,
             &hdrs,
@@ -159,7 +171,7 @@ async fn handle(
     }
 
     match method {
-        Method::POST => post(&ep, &hdrs, &body, &principal).await,
+        Method::POST => post(&ep, &hdrs, &body, &principal, &profile).await,
         Method::DELETE => {
             if let Some(sid) = hdrs.get("mcp-session-id") {
                 ep.sessions.lock().unwrap().remove(sid);
@@ -181,6 +193,7 @@ fn error_json(status: StatusCode, msg: &str) -> Response {
 /// `POST /attach` create · `GET /attach` list · `GET|DELETE /attach/{id}` read / revoke.
 async fn attach_route(
     mgr: &AttachManager,
+    access: Option<&crate::access::Access>,
     method: &Method,
     path: &str,
     hdrs: &HashMap<String, String>,
@@ -213,8 +226,17 @@ async fn attach_route(
                 return error_json(StatusCode::BAD_REQUEST, "session is required");
             };
             let profile_str = str_field("profile").unwrap_or_else(|| "sandbox".into());
-            let Some(profile) = ToolProfile::parse(&profile_str) else {
-                let all: Vec<&str> = ToolProfile::ALL.iter().map(|p| p.as_str()).collect();
+            let found = match access {
+                Some(a) => a.profile(&profile_str),
+                None => ToolProfile::built_in(&profile_str),
+            };
+            let Some(profile) = found else {
+                let all = access.map(|a| a.profile_names()).unwrap_or_else(|| {
+                    ToolProfile::BUILT_IN
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                });
                 return error_json(
                     StatusCode::BAD_REQUEST,
                     &format!("profile must be one of {all:?}"),
@@ -259,6 +281,7 @@ async fn post(
     hdrs: &HashMap<String, String>,
     body: &[u8],
     principal: &str,
+    profile: &ToolProfile,
 ) -> Response {
     let ct_json = hdrs
         .get("content-type")
@@ -294,7 +317,19 @@ async fn post(
     }
     // No session header on a non-initialize request: lenient, so curl probes work.
 
-    let mut resp = match ep.server.handle(&rpc).await {
+    // A narrowed profile gets a scoped server: the tools it may not use are absent from
+    // tools/list and "unknown" on tools/call, exactly as for a lent sandbox.
+    let scoped;
+    let server = if profile.is_owner() {
+        &ep.server
+    } else {
+        scoped = ep.server.scoped(
+            profile.clone(),
+            crate::attach::restricted_instructions(profile, ep.server.instructions.as_deref()),
+        );
+        &scoped
+    };
+    let mut resp = match server.handle(&rpc).await {
         None => StatusCode::ACCEPTED.into_response(), // notification
         Some(v) => {
             if rpc.method == "tools/call" {

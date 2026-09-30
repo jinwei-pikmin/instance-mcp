@@ -47,6 +47,8 @@ if [[ ! -s "$token_file" ]]; then
   (umask 077; head -c 32 /dev/urandom | base64 | tr -d '=+/\n' > "$token_file")
 fi
 chmod 600 "$token_file"
+# Custom profiles are opt-in: leave the example beside the real file, never activate it.
+install -m600 "$here/profiles.example.toml" "$(dirname "$token_file")/profiles.example.toml"
 
 unit_dir="$HOME/.config/systemd/user"
 install -d "$unit_dir"
@@ -124,4 +126,8 @@ echo "MCP URL:  https://$dns:$https_port/mcp"
 if [[ "$http_port" != 0 ]]; then
   echo "          http://$dns:$http_port/mcp   (tailnet-only plain HTTP, for proxied callers)"
 fi
-echo "Token:    $token_file"
+echo "Token:    $token_file   (owner)"
+echo
+echo "Narrower access for a caller (e.g. a cloud agent): define a profile in"
+echo "  $(dirname "$token_file")/profiles.toml   (see profiles.example.toml there)"
+echo "then:  oab-instance-mcp token add <name> --profile <profile>"

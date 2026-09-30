@@ -95,7 +95,7 @@ impl Grant {
             "id": self.id,
             "runtime": self.runtime.to_string(),
             "session": self.session,
-            "profile": self.profile.as_str(),
+            "profile": self.profile.name(),
             "principal": self.principal,
             "created_at": iso(self.created_at),
             "expires_at": iso(self.expires_at),
@@ -180,13 +180,13 @@ impl AttachManager {
 
         let id = uuid::Uuid::new_v4().to_string();
         let now = SystemTime::now();
-        let instructions = sandbox_instructions(req.profile, self.base.instructions.as_deref());
-        let scoped = self.base.scoped(req.profile, instructions);
+        let instructions = sandbox_instructions(&req.profile, self.base.instructions.as_deref());
+        let scoped = self.base.scoped(req.profile.clone(), instructions);
         let cfg = Config::new(
             runtime.clone(),
             req.session.clone(),
             secret,
-            req.profile,
+            req.profile.clone(),
             Instant::now() + ttl,
         );
 
@@ -203,7 +203,7 @@ impl AttachManager {
         log(&format!(
             "grant {} by {principal}: {} → {}/{} for {}s",
             &id[..8],
-            req.profile.as_str(),
+            req.profile.name(),
             runtime.host().unwrap_or("?"),
             req.session,
             ttl.as_secs()
@@ -258,18 +258,34 @@ impl AttachManager {
     }
 }
 
-fn sandbox_instructions(profile: ToolProfile, base: Option<&str>) -> Option<String> {
-    if profile != ToolProfile::Sandbox {
+fn sandbox_instructions(profile: &ToolProfile, base: Option<&str>) -> Option<String> {
+    if profile.is_owner() {
         return base.map(String::from);
     }
     let head = base.map(|b| format!("{b}\n\n")).unwrap_or_default();
     Some(format!(
         "{head}You reached this machine through OpenAB Connect: a human lent it to your sandbox \
-         session for a limited time and may be watching. This is the `sandbox` profile — there is \
-         no `exec` tool here (you already have a shell in your own session); use the tools that \
-         `tools/list` shows, and — when `browser_*` tools are listed — drive the browser directly: \
-         `browser_navigate` then `browser_snapshot` gives you the page as text. If a tool starts \
-         failing with \"not attached\", the grant ended; ask the human to lend the machine again."
+         session for a limited time and may be watching. This is the `{name}` profile — only the \
+         tools that `tools/list` shows exist here (there is no `exec` unless it is listed; you \
+         already have a shell in your own session). When `browser_*` tools are listed, drive the \
+         browser directly: `browser_navigate` then `browser_snapshot` gives you the page as text. \
+         If a tool starts failing with \"not attached\", the grant ended; ask the human to lend \
+         the machine again.",
+        name = profile.name()
+    ))
+}
+
+/// Instructions for a direct (non-attach) caller on a narrowed profile, e.g. a named token.
+/// None for owner: the base instructions stand.
+pub fn restricted_instructions(profile: &ToolProfile, base: Option<&str>) -> Option<String> {
+    if profile.is_owner() {
+        return None;
+    }
+    Some(format!(
+        "This connection uses the restricted profile `{name}`: only the tools in `tools/list` exist \
+         for you. Ignore any guidance below about tools that are not listed.\n\n{base}",
+        name = profile.name(),
+        base = base.unwrap_or("")
     ))
 }
 

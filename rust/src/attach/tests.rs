@@ -95,7 +95,7 @@ async fn sandbox_sys_info_reports_the_sandbox_tool_list() {
 async fn sandbox_drops_every_exec_tool_and_carries_its_own_instructions() {
     let s = full_server().scoped(
         ToolProfile::Sandbox,
-        sandbox_instructions(ToolProfile::Sandbox, Some("base")),
+        sandbox_instructions(&ToolProfile::Sandbox, Some("base")),
     );
     assert_eq!(s.tool_names(), vec!["echo", "screenshot"]);
     let i = s.instructions.unwrap();
@@ -108,7 +108,7 @@ async fn sandbox_drops_every_exec_tool_and_carries_its_own_instructions() {
         4
     );
     assert_eq!(
-        sandbox_instructions(ToolProfile::Owner, Some("base")).as_deref(),
+        sandbox_instructions(&ToolProfile::Owner, Some("base")).as_deref(),
         Some("base")
     );
 }
@@ -239,7 +239,7 @@ async fn bad_requests_are_400() {
 async fn create_list_replace_revoke() {
     let (a, _) = app(None, true);
     // Unreachable runtime: the grant exists and the client is dialing/redialing.
-    let body = json!({"runtime": "ws://127.0.0.1:9", "session": "laptop", "secret": "abc", "ttl_secs": 60});
+    let body = json!({"runtime": "ws://127.0.0.1:9", "session": "laptop", "secret": "s3cret-never-echoed", "ttl_secs": 60});
     let (st, g) = send(&a, "POST", "/attach", Some(body), true).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{g}");
     let id = g["id"].as_str().unwrap().to_string();
@@ -251,7 +251,10 @@ async fn create_list_replace_revoke() {
         ),
         (Some("sandbox"), Some("a@b"), Some("laptop"))
     );
-    assert!(!g.to_string().contains("abc"), "secret must not be echoed");
+    assert!(
+        !g.to_string().contains("s3cret-never-echoed"),
+        "secret must not be echoed"
+    );
 
     assert_eq!(
         send(&a, "GET", "/attach", None, true).await.1["grants"]
@@ -591,4 +594,122 @@ async fn cancel_is_terminal_and_sticky() {
     h.cancel();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(h.state(), State::Ended(Terminal::Cancelled));
+}
+
+// MARK: - named tokens and custom profiles over HTTP
+
+#[tokio::test]
+async fn a_named_token_gets_its_profile_and_cannot_use_attach() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("profiles.toml"),
+        "[profiles.browser]\nallow = [\"sys_info\", \"echo\", \"browser_*\"]\ndeny = [\"echo\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("tokens.toml"),
+        format!(
+            "[tokens.hermes]\nprofile = \"browser\"\nsha256 = \"{}\"\ncreated = \"t\"\n",
+            crate::access::sha256_hex("oabt_hermes")
+        ),
+    )
+    .unwrap();
+    let auth = AuthPolicy::new(["a@b".into()], Some("owner-token".into()), false)
+        .with_access(crate::access::Access::new(dir.path()));
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(crate::tools::sysinfo::SysInfoTool {
+            agent_version: "t",
+            tool_names: vec![],
+        }),
+        Arc::new(Fake("echo")),
+        Arc::new(Fake("exec")),
+        Arc::new(Fake("screenshot")),
+    ];
+    let server = McpServer::new("t", "0", None, tools);
+    let mgr = AttachManager::new(server.clone(), None);
+    let app = router(Endpoint::new("/mcp".into(), server, auth, Some(mgr)));
+
+    let call = |token: &'static str, method: &'static str, path: &'static str, body: Value| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .header("tailscale-user-login", "a@b")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5555))));
+            let r = app.oneshot(req).await.unwrap();
+            let status = r.status();
+            let bytes = r.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let names = |v: &Value| -> Vec<String> {
+        v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().into())
+            .collect()
+    };
+
+    // Owner sees everything; the named token only what its profile allows (deny wins on echo).
+    let (_, all) = call("owner-token", "POST", "/mcp", list.clone()).await;
+    assert_eq!(names(&all), ["sys_info", "echo", "exec", "screenshot"]);
+    let (_, narrow) = call("oabt_hermes", "POST", "/mcp", list.clone()).await;
+    assert_eq!(names(&narrow), ["sys_info"]);
+    let (_, refused) = call(
+        "oabt_hermes",
+        "POST",
+        "/mcp",
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "exec"}}),
+    )
+    .await;
+    assert_eq!(
+        refused["error"]["message"],
+        "Invalid params: unknown tool: exec"
+    );
+    let (_, si) = call(
+        "oabt_hermes",
+        "POST",
+        "/mcp",
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "sys_info"}}),
+    )
+    .await;
+    assert_eq!(
+        si["result"]["structuredContent"]["capabilities"]["exec"], false,
+        "sys_info reports the narrowed list"
+    );
+
+    // /attach is owner-only: a narrowed token must not lend the machine to anyone.
+    let lend =
+        json!({"runtime": "ws://127.0.0.1:9", "session": "x", "secret": "s", "profile": "owner"});
+    assert_eq!(
+        call("oabt_hermes", "POST", "/attach", lend.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call("oabt_hermes", "GET", "/attach", Value::Null).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // The owner can lend with a custom profile by name, and unknown names are listed back.
+    let custom = json!({"runtime": "ws://127.0.0.1:9", "session": "x", "secret": "s", "profile": "browser", "ttl_secs": 60});
+    let (st, g) = call("owner-token", "POST", "/attach", custom).await;
+    assert_eq!(
+        (st, g["profile"].as_str()),
+        (StatusCode::ACCEPTED, Some("browser"))
+    );
+    let bad =
+        json!({"runtime": "ws://127.0.0.1:9", "session": "x", "secret": "s", "profile": "nope"});
+    let (st, e) = call("owner-token", "POST", "/attach", bad).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(e["error"].as_str().unwrap().contains("browser"), "{e}");
 }

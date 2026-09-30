@@ -1,6 +1,7 @@
 //! oab-instance-mcp (Rust) — MCP server exposing this machine to a coding CLI or agent on
 //! the tailnet. Same flags, auth and wire contract as the Swift build; see `README.md`.
 
+mod access;
 mod attach;
 mod auth;
 mod http;
@@ -58,7 +59,9 @@ fn usage() -> ! {
     println!(
         "oab-instance-mcp {VERSION} (Rust, {os}) — MCP server exposing this machine (exec / screenshot / mouse / key / sys_info)
 
-USAGE: oab-instance-mcp [--host 127.0.0.1] [--port 8795] [--path /mcp]
+USAGE: oab-instance-mcp token add <name> --profile <profile> | token list | token revoke <name>
+       oab-instance-mcp profile list
+       oab-instance-mcp [--host 127.0.0.1] [--port 8795] [--path /mcp]
                         [--allow-login <email>]... [--token <str> | --token-file <path>]
                         [--insecure-local] [--quiet] [--log-requests] [--no-attach] [--no-desktop]
 
@@ -81,6 +84,13 @@ Auth (at least one required unless --insecure-local):
                   connection's tool profile. Repeatable. Tools keep the upstream's own names;
                   sandbox sees an allowlisted subset of browser_*.
 
+Named tokens and profiles (operator-managed, in the config dir, hot-reloaded):
+  tokens.toml     `token add` stores a SHA-256 hash; the caller sends the token as its Bearer
+                  and gets that token's profile instead of owner (login check still applies).
+  profiles.toml   [profiles.<name>] allow = [\"sys_info\", \"browser_*\"]  deny = [...]
+                  Deny wins; anything not allowed is denied. owner / sandbox are built in.
+  /attach accepts only the owner token.
+
 Not yet in the Rust build: --menu-bar.
 
 Run it as a systemd *user* service in the logged-in user's session, bound to loopback,
@@ -91,6 +101,12 @@ behind `tailscale serve` (see rust/deploy/).",
 }
 
 fn parse_args() -> Options {
+    // Operator subcommands: manage named tokens / inspect profiles, then exit.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(argv.first().map(String::as_str), Some("token" | "profile")) {
+        let _ = QUIET.set(true); // daemon log lines are noise for a CLI user
+        std::process::exit(access::cli(&platform::backend().config_dir(), &argv));
+    }
     let mut o = Options {
         host: "127.0.0.1".into(),
         port: 8795,
@@ -218,11 +234,13 @@ async fn main() {
     let _ = QUIET.set(opts.quiet);
     let _ = LOG_REQUESTS.set(opts.log_requests);
 
+    let config_dir = platform::backend().config_dir();
     let auth = AuthPolicy::new(
         opts.allow_logins.clone(),
         opts.token.clone(),
         opts.insecure_local,
-    );
+    )
+    .with_access(access::Access::new(&config_dir));
     if let Err(e) = auth.validate() {
         eprintln!("{e}");
         std::process::exit(64)

@@ -37,6 +37,9 @@ pub trait PlatformBackend: Send + Sync {
     /// Where background job logs go.
     fn job_log_dir(&self) -> PathBuf;
 
+    /// The operator's config dir: token, named tokens, custom profiles, portal consent.
+    fn config_dir(&self) -> PathBuf;
+
     /// Screen and input, if this host has a desktop we can drive. None ⇒ the screenshot /
     /// mouse / key tools are not registered (headless nodes keep exec and sys_info).
     fn desktop(&self) -> Option<Arc<dyn Desktop>>;

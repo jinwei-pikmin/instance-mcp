@@ -1,0 +1,26 @@
+# Custom tool profiles for oab-instance-mcp. Copy to ~/.config/oab-instance-mcp/profiles.toml
+# (install.sh leaves this example next to it) and edit; the daemon re-reads it on change.
+#
+# Rules: only tools matched by `allow` are available; `deny` wins over `allow`; `*` matches any
+# run of characters; tools added later (e.g. new browser_* tools) stay denied unless an allow
+# pattern matches them. `owner` (everything) and `sandbox` (no exec*, a safe browser_* subset)
+# are built in and cannot be redefined here. A file that fails to parse is rejected and the
+# previous version stays in force.
+#
+# Bind a profile to a caller with a named token:
+#   oab-instance-mcp token add hermes --profile browser
+# or lend the machine to an openab-pty session with it: POST /attach {"profile": "browser", …}
+
+# Look only: machine facts and screenshots.
+[profiles.viewer]
+allow = ["sys_info", "screenshot"]
+
+# Browser only: navigate, read, click, type, screenshot the page — no desktop input, no shell.
+[profiles.browser]
+allow = ["sys_info", "browser_*"]
+deny  = ["browser_run_code_unsafe", "browser_file_upload", "browser_pdf_save"]
+
+# Desktop and browser, no shell. Close to the built-in sandbox, but yours to adjust.
+[profiles.desktop]
+allow = ["sys_info", "screenshot", "mouse", "key", "browser_*"]
+deny  = ["browser_run_code_unsafe", "browser_file_upload"]

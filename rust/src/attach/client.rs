@@ -299,7 +299,7 @@ async fn dial_once(
     log(&format!(
         "attach {}: attached as {} to {host}",
         cfg.session,
-        cfg.profile.as_str()
+        cfg.profile.name()
     ));
 
     let (mut sink, mut stream) = ws.split();

@@ -57,6 +57,10 @@ impl PlatformBackend for Linux {
             .clone()
     }
 
+    fn config_dir(&self) -> PathBuf {
+        config_dir()
+    }
+
     /// `$XDG_STATE_HOME/oab-instance-mcp/jobs` (default `~/.local/state/...`).
     fn job_log_dir(&self) -> PathBuf {
         let base = std::env::var_os("XDG_STATE_HOME")
