@@ -18,6 +18,7 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("ApplicationServices"),
                 .linkedFramework("Network"),
+                .linkedFramework("Security"),
             ]
         ),
         // Thin CLI: flag parsing + wiring. No logic worth testing lives here.

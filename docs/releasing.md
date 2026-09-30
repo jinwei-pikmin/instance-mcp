@@ -81,8 +81,17 @@ deleted in an `always()` cleanup step.
    git push origin v0.7.0
    ```
 
-4. The `Release macOS installer` workflow builds/tests, signs, notarizes and publishes. A manual
-   dispatch can retry an existing tag; it is not a way to release an untagged commit.
+4. The `Release macOS installer` workflow builds/tests, signs, notarizes and publishes the macOS
+   artifacts, and (since 0.6.7) `oab-instance-mcp-VERSION-linux-{arm64,amd64}.tar.gz` + `.sha256`
+   from the same run. All three jobs wait on the `release` environment approval. A manual
+   dispatch can retry an existing tag; it is not a way to release an untagged commit, and it
+   **must run on the tag ref** — the environment only allows `v*` refs, so a dispatch from
+   `main` is rejected before any job starts ("Branch main is not allowed to deploy to release"):
+
+   ```sh
+   gh workflow run release.yml --ref v0.7.0 -f tag=v0.7.0
+   ```
+
 5. Download both artifacts and verify before installing:
 
    ```sh
@@ -120,8 +129,8 @@ lipo -create /tmp/imcp-arm64/release/oab-instance-mcp \
              /tmp/imcp-x86_64/release/oab-instance-mcp \
              -output /tmp/oab-instance-mcp
 chmod +x /tmp/oab-instance-mcp
-scripts/assemble-app.sh /tmp/oab-instance-mcp /tmp/oab-instance-mcp.app 0.6.4
-ALLOW_UNSIGNED=1 scripts/package-pkg.sh /tmp/oab-instance-mcp.app /tmp/oab-instance-mcp.pkg 0.6.4
+scripts/assemble-app.sh /tmp/oab-instance-mcp /tmp/oab-instance-mcp.app 0.6.7
+ALLOW_UNSIGNED=1 scripts/package-pkg.sh /tmp/oab-instance-mcp.app /tmp/oab-instance-mcp.pkg 0.6.7
 ```
 
 Unsigned artifacts are testing inputs only; do not install or publish them.

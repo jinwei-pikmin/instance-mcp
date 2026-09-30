@@ -44,22 +44,67 @@ flowchart LR
     tcc -. "gates screen / input / apps" .-> hands
 ```
 
-Read it left to right: the model and its reasoning live in the caller; the Mac only receives
-tool calls, and the daemon can do nothing a logged-in user sitting at that Mac could not do.
-Everything on the right is one machine — no cloud hop, no control plane; `tailscale serve`
-terminates TLS on the box and stamps each request with the caller's Tailscale identity, which
-the daemon checks together with a bearer token. The tools that touch the screen or inject input
-are gated by macOS TCC, granted once on the Mac's own screen to the stable bundle id. The loop
-the tools are built for: `screenshot` → decide → `mouse` / `key` / `osascript` / `exec` →
-`screenshot` to confirm.
+Read it left to right: the model and its reasoning live in the caller; the machine only receives
+tool calls, and the daemon can do nothing a logged-in user sitting at it could not do. Everything
+on the right is one machine — no cloud hop, no control plane; `tailscale serve` terminates TLS and
+stamps each request with the caller's Tailscale identity, which the daemon checks together with a
+bearer token. On macOS the tools that touch screen or input are gated by TCC, granted once to the
+stable bundle id. The loop the tools are built for: `screenshot` → decide →
+`mouse` / `key` / `osascript` / `exec` → `screenshot` to confirm. SSH already gives you a shell;
+this exists for what SSH cannot reach.
 
-Two servers, one pattern: bind loopback, let `tailscale serve` do TLS and identity, run as a
-LaunchAgent in the GUI session so TCC-gated things (screen, later input) work. SSH already gives
-you a shell; this exists for what SSH cannot reach.
+## Contents
 
-- `oab-instance-mcp` — this package. Swift, zero dependencies (Network.framework + ScreenCaptureKit).
-- Browser — `@playwright/mcp`, not ours. See [`poc/pw-mcp/README.md`](poc/pw-mcp/README.md).
-- Design notes: [`docs/requirements/connect-closed-loop.md`](docs/requirements/connect-closed-loop.md).
+- [Quick start](#quick-start) · [Platforms](#platforms)
+- [Tools](#tools) · [Auth](#auth)
+- [Reverse attach](#lending-this-mac-to-a-sandboxed-agent-reverse-attach) · [Browser tools](#browser-tools-for-lent-sessions---upstream)
+- Deploy & operate: [Download and install](#download-and-install) · [Build & test](#build--test-on-macmini-the-laptop-never-compiles-swift) · [Deploy](#deploy-run-on-the-target) · [Menu bar](#menu-bar) · [Operate](#operate)
+- Operator notes: [TCC & signing](#tcc-grants-survive-re-deploys-only-if-the-signature-does) · [Gotchas](#gotchas-each-one-cost-a-cycle)
+
+Components: `oab-instance-mcp` is this package (Swift on macOS, zero deps; Rust on Linux). The
+browser server is `@playwright/mcp`, not ours ([`poc/pw-mcp/README.md`](poc/pw-mcp/README.md)).
+Design notes: [`docs/requirements/connect-closed-loop.md`](docs/requirements/connect-closed-loop.md).
+
+## Quick start
+
+**macOS** — download `oab-instance-mcp-VERSION-universal.pkg` from
+[Releases](https://github.com/openabdev/instance-mcp/releases), double-click, and follow the
+permissions wizard ([details](#download-and-install)). Then point a caller at it:
+
+```sh
+kiro-cli mcp add --name macmini-mcp --url https://<host>.<tailnet>.ts.net:8444/mcp \
+  --header "Authorization: Bearer $(ssh <host> cat ~/.config/oab-instance-mcp/token)" \
+  --scope global --timeout 30000
+```
+
+**Linux** (Raspberry Pi, Intel mini PC) — one installer does the whole node
+([full guide](docs/linux-setup.md)):
+
+```sh
+V=$(curl -fsSL https://api.github.com/repos/openabdev/instance-mcp/releases/latest | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"][1:])')
+A=$(dpkg --print-architecture)   # arm64 | amd64
+curl -fsSLO "https://github.com/openabdev/instance-mcp/releases/download/v$V/oab-instance-mcp-$V-linux-$A.tar.gz"
+tar xzf oab-instance-mcp-$V-linux-$A.tar.gz && cd oab-instance-mcp-$V-linux-$A
+./install-linux.sh                # a box with no desktop: add --headless-seat
+```
+
+The URL is `https://<host>.<tailnet>.ts.net:8444/mcp` and the bearer token is in
+`~/.config/oab-instance-mcp/token` on the node.
+
+## Platforms
+
+| | macOS | Linux |
+|---|---|---|
+| Implementation | Swift (Network.framework + ScreenCaptureKit) | Rust (`poc/reverse-attach-linux/`) |
+| Screen / input | ScreenCaptureKit · CGEvent, gated by TCC | grim · wlroots virtual pointer · wtype on a wlroots seat (labwc, sway) |
+| Shell | `exec` / `exec_start*` (`zsh -f`) | `bash` |
+| Apps | `osascript` / JXA | — (use `bash`: `gdbus`, `xdg-open`) |
+| Reverse attach · browser upstream | ✅ | ✅ |
+| Install | signed/notarized `.pkg` | `-linux-{arm64,amd64}.tar.gz` + `install-linux.sh` |
+| Guide | this README | [`docs/linux-setup.md`](docs/linux-setup.md) |
+
+The rest of this README is the macOS reference; the two platforms share the wire contract, auth
+and reverse-attach shape, so callers configure them identically.
 
 ## Tools
 
@@ -183,6 +228,8 @@ Tagged releases publish a universal, Developer-ID-signed and Apple-notarized ins
 5. The same wizard remains available from the menu bar as **Set Up Permissions…**; use the menu
    item to copy the MCP URL and bearer token into OpenAB Connect/Remote.
 
+Linux hands nodes: see [Quick start](#quick-start) and [`docs/linux-setup.md`](docs/linux-setup.md).
+
 The `.app.zip` beside the package is an advanced/manual artifact. After unzipping:
 
 ```sh
@@ -193,19 +240,6 @@ The `.app.zip` beside the package is an advanced/manual artifact. After unzippin
 The installer never re-signs the app: doing so would change the identity TCC grants are bound to.
 See [`docs/releasing.md`](docs/releasing.md) for artifacts, signing/notarization, required secrets,
 local packaging smoke, and the current first-release signing blocker.
-
-## TCC grants survive re-deploys only if the signature does
-
-Screen Recording, Accessibility and Full Disk Access are keyed on the **code-signing identity +
-bundle id**, not the path. So a grant you make once in System Settings stays across upgrades
-**only if every build is signed by the same identity**. An ad-hoc signature (`codesign -s -`)
-has no stable identity — macOS treats each one as a new app and silently drops every grant, and
-the symptom is the Screens pane freezing / `screen_recording=false` after a deploy.
-
-Therefore `deploy.sh` **refuses to install anything but a Team-signed bundle** (team `6LPQNY95AQ`).
-Run it from a console session (the login keychain is locked over SSH, which is why ad-hoc kept
-sneaking in). You grant each permission **once**; later versions keep it. Override for a throwaway
-local build with `ALLOW_ADHOC=1`, accepting that you will have to re-grant.
 
 ## Build & test (on macmini; the laptop never compiles Swift)
 
@@ -274,6 +308,19 @@ ssh macmini 'tail -f ~/Library/Logs/oab-instance-mcp/jobs/<job_id>.out'  # follo
 ```
 
 Measured from the laptop: `sys_info` 0.75 s, `exec` 0.47 s, a 1 s exec timeout returns in 1.6 s.
+
+## TCC grants survive re-deploys only if the signature does
+
+Screen Recording, Accessibility and Full Disk Access are keyed on the **code-signing identity +
+bundle id**, not the path. So a grant you make once in System Settings stays across upgrades
+**only if every build is signed by the same identity**. An ad-hoc signature (`codesign -s -`)
+has no stable identity — macOS treats each one as a new app and silently drops every grant, and
+the symptom is the Screens pane freezing / `screen_recording=false` after a deploy.
+
+Therefore `deploy.sh` **refuses to install anything but a Team-signed bundle** (team `6LPQNY95AQ`).
+Run it from a console session (the login keychain is locked over SSH, which is why ad-hoc kept
+sneaking in). You grant each permission **once**; later versions keep it. Override for a throwaway
+local build with `ALLOW_ADHOC=1`, accepting that you will have to re-grant.
 
 ## Gotchas (each one cost a cycle)
 

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "description": "Conformance vectors for ReverseAttachClient.disposition() + attachURL. Oracle: Swift ReverseAttachClient.swift §9.2.",
+  "close_code": [
+    {"code": 4001, "expect": {"stop": "grantExpired"}},
+    {"code": 4002, "expect": {"stop": "replaced"}},
+    {"code": 4004, "expect": {"stop": "sessionEnded"}},
+    {"code": 4010, "expect": {"stop": "revoked"}},
+    {"code": 4006, "expect": {"redial": true}},
+    {"code": 1000, "expect": {"redial": true}},
+    {"code": 1006, "expect": {"redial": true}},
+    {"code": 4999, "expect": {"redial": true}},
+    {"code": 4003, "expect": {"redial": true}}
+  ],
+  "handshake_status": [
+    {"status": 101, "expect": {"redial": true}},
+    {"status": 200, "expect": {"redial": true}},
+    {"status": 204, "expect": {"redial": true}},
+    {"status": 429, "expect": {"redial": true}},
+    {"status": 500, "expect": {"redial": true}},
+    {"status": 503, "expect": {"redial": true}},
+    {"status": 599, "expect": {"redial": true}},
+    {"status": 401, "expect": {"stop_rejected": 401}},
+    {"status": 403, "expect": {"stop_rejected": 403}},
+    {"status": 404, "expect": {"stop_rejected": 404}},
+    {"status": 400, "expect": {"stop_rejected": 400}}
+  ],
+  "attach_url": [
+    {"runtime": "ws://100.111.174.31:8090", "session": "abc", "expect": "ws://100.111.174.31:8090/tools/attach/abc"},
+    {"runtime": "wss://pod.tail.ts.net", "session": "s1", "expect": "wss://pod.tail.ts.net/tools/attach/s1"},
+    {"runtime": "ws://host:9/base/", "session": "x", "expect": "ws://host:9/base/tools/attach/x"}
+  ]
+}

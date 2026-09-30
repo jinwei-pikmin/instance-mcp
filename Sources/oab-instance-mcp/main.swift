@@ -4,7 +4,7 @@ import CoreGraphics
 import Foundation
 import InstanceMCPCore
 
-let version = "0.6.4"
+let version = "0.6.7"
 
 struct Options {
     var host = "127.0.0.1"
@@ -18,6 +18,7 @@ struct Options {
     var menuBar = false
     var publicURL: String? = nil
     var attach = true
+    var persistGrants = true
     /// name=url pairs; each is a loopback MCP server whose tools are re-served.
     var upstreams: [(String, URL)] = []
 }
@@ -44,6 +45,10 @@ func usage() -> Never {
       --no-attach     Disable the reverse-attach plane (POST/GET /attach, DELETE /attach/{id}):
                       the human-credentialed endpoint through which Connect / Remote lends this
                       Mac to one openab-pty session (this Mac dials the pod; see the ADR).
+      --no-grant-persistence
+                      Keep reverse-attach grants in memory only. By default live grants are
+                      saved (record: ~/Library/Application Support/oab-instance-mcp/grants.json,
+                      mode 600; secret: login Keychain) and re-dialled after a restart.
       --menu-bar      Show a status item in the menu bar (permissions, activity, restart/quit).
       --public-url    The URL clients use (shown/copied from the menu); defaults to the local one.
 
@@ -73,6 +78,7 @@ while !args.isEmpty {
     case "--insecure-local": opts.insecureLocal = true
     case "--quiet": opts.quiet = true
     case "--menu-bar": opts.menuBar = true
+    case "--no-grant-persistence": opts.persistGrants = false
     case "--public-url": opts.publicURL = next(a)
     case "--no-attach": opts.attach = false
     case "--upstream":
@@ -134,7 +140,11 @@ let server = MCPServer(
     tools: [SysInfoTool(agentVersion: version), ExecTool(), ExecStartTool(), ExecPollTool(), ExecListTool(), ExecCancelTool(), ScreenshotTool(), MouseTool(), KeyTool(), OsascriptTool()],
     upstreams: opts.upstreams.map { UpstreamMCP(name: $0.0, url: $0.1, log: log) }
 )
-let attachManager: AttachManager? = opts.attach ? AttachManager(server: server, log: log) : nil
+let attachManager: AttachManager? = opts.attach
+    ? AttachManager(server: server,
+                    store: opts.persistGrants ? FileGrantStore(log: log) : nil,
+                    log: log)
+    : nil
 let endpoint = MCPHTTPEndpoint(path: opts.path, server: server, auth: auth, attach: attachManager, log: log)
 
 // Must be a global: a `let` inside `do {}` is released after the block and the
@@ -153,6 +163,12 @@ log("oab-instance-mcp \(version) starting on http://\(opts.host):\(opts.port)\(o
     "accessibility=\(startupPermissions.accessibility.isGranted) " +
     "full_disk_access=\(startupPermissions.fullDiskAccess.isGranted)")
 http.start()
+if let attachManager {
+    Task {
+        let n = await attachManager.resume()
+        if n > 0 { log("resumed \(n) reverse-attach grant(s) from the previous run") }
+    }
+}
 
 signal(SIGPIPE, SIG_IGN)
 let stop = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
