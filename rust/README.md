@@ -49,7 +49,7 @@ an upstream that is down simply contributes nothing, and a lost upstream session
 once. `--no-browser` skips it.
 
 Named tokens and custom profiles — give each caller only what it needs (operator-managed;
-a client never picks its own profile):
+a client never picks its own profile). Full reference: [docs/access-control.md](docs/access-control.md).
 
 ```sh
 cp ~/.config/oab-instance-mcp/profiles.example.toml ~/.config/oab-instance-mcp/profiles.toml
